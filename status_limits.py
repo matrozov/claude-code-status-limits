@@ -15,8 +15,10 @@ Rate-limit бары — название рендерится текстом п�
 Ширина баров адаптируется под ширину терминала.
 """
 
+import hashlib
 import io
 import json
+import os
 import subprocess
 import sys
 import time as time_module
@@ -29,6 +31,16 @@ CTX_BAR_WIDTH     = 6
 FIVE_HOUR_SECONDS = 5 * 3600
 SEVEN_DAY_SECONDS = 7 * 24 * 3600
 API_CACHE_TTL     = 300  # секунд
+
+# Размер буфера autocompact в токенах — фиксированная величина, не зависящая
+# от размера контекстного окна. Claude Code резервирует этот буфер и запускает
+# компрессию при достижении (context_window_size - AUTOCOMPACT_BUFFER_TOKENS).
+# Для 200K окна буфер ≈ 16.5%, для 1M — ≈ 3.3%.
+AUTOCOMPACT_BUFFER_TOKENS: int = 33_000
+
+# Если установлена CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, Claude Code использует её
+# как порог запуска компрессии (процент от окна), что неявно меняет размер буфера.
+_autocompact_pct_override: str | None = os.environ.get('CLAUDE_AUTOCOMPACT_PCT_OVERRIDE')
 
 # Поля, получаемые из stdin (не из API)
 STDIN_BAR_FIELDS = {'five_hour', 'seven_day'}
@@ -45,8 +57,9 @@ BG_TIME_ONLY  = '\033[48;2;0;80;22m'       # только время (тёмно
 BG_TOKEN_ONLY = '\033[48;2;190;135;0m'     # только токены (янтарный)
 BG_EMPTY      = '\033[48;2;55;55;55m'      # пусто (тёмно-серый)
 
-# Фоновый цвет контекстного бара (заполненная часть)
-FG_CTX_FILLED = '\033[37m'
+# Цвета заполненной части контекстного бара
+FG_CTX_FILLED = '\033[37m'                  # норма (серый)
+FG_CTX_WARN   = '\033[38;2;190;135;0m'      # превышен порог autocompact (янтарный)
 
 # Подписи баров — рендерятся поверх фона, поэтому могут быть длиннее
 LABEL_MAP = {
@@ -75,27 +88,30 @@ def get_label(field: str) -> str:
     return LABEL_MAP.get(field, field.replace('_', ' ').title())
 
 
-def make_ctx_bar(percentage: float | None, width: int) -> str:
+def make_ctx_bar(percentage: float | None, width: int, warn: bool = False) -> str:
     """
     Бар контекстного окна с субсимвольным краем через восьмушки, без подписи.
 
-    - percentage: процент заполненности (0–100 или None)
+    - percentage: процент заполненности (0–100 или None); значения >100 обрезаются до 100
     - width:      ширина бара в символах
+    - warn:       если True — заполненная часть рисуется янтарным (контекст вошёл в буфер autocompact)
     """
     if percentage is None:
         return f'{BG_EMPTY}{" " * width}{FG_RESET}'
 
+    color      = FG_CTX_WARN if warn else FG_GRAY_LIGHT
+    percentage = min(100.0, percentage)
     fill_exact = percentage / 100.0 * width
     full_cells = int(fill_exact)
     remainder  = fill_exact - full_cells
 
     cells = []
     if full_cells > 0:
-        cells.append(f'{FG_GRAY_LIGHT}{"█" * full_cells}{FG_RESET}')
+        cells.append(f'{color}{"█" * full_cells}{FG_RESET}')
 
     if full_cells < width and remainder > 0:
         eighth_index = max(0, round(remainder * 8) - 1)
-        cells.append(f'{BG_EMPTY}{FG_GRAY_LIGHT}{"▏▎▍▌▋▊▉█"[eighth_index]}{FG_RESET}')
+        cells.append(f'{BG_EMPTY}{color}{"▏▎▍▌▋▊▉█"[eighth_index]}{FG_RESET}')
         empty_start = full_cells + 1
     else:
         empty_start = full_cells
@@ -193,9 +209,25 @@ def write_cache(cache_path: Path, cache: dict) -> None:
         pass
 
 
+def _token_fingerprint(credentials_path: Path) -> str | None:
+    """
+    Возвращает короткий хэш OAuth-токена для отслеживания его смены.
+
+    Хранится в кеше как _token_fingerprint. Если токен изменился (перезапуск
+    Claude Code обновил авторизацию), TTL сбрасывается для немедленного обновления.
+    """
+    try:
+        creds = json.loads(credentials_path.read_text(encoding='utf-8'))
+        token = creds['claudeAiOauth']['accessToken']
+        return hashlib.sha256(token.encode()).hexdigest()[:16]
+    except Exception:
+        return None
+
+
 def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict) -> bool:
     """
-    Обновляет cached_bars из OAuth usage API если истёк TTL (API_CACHE_TTL секунд).
+    Обновляет cached_bars из OAuth usage API если истёк TTL (API_CACHE_TTL секунд)
+    или если OAuth-токен изменился с момента последнего запроса.
 
     Перед попыткой запроса очищает все API-бары из cached_bars. На успехе заполняет
     актуальными данными. На любой ошибке (недоступен API, ошибка авторизации, таймаут)
@@ -210,6 +242,11 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict) ->
     - cache:            верхний уровень кеша (для хранения _api_cached_at)
     - cached_bars:      словарь баров для обновления
     """
+    fingerprint = _token_fingerprint(credentials_path)
+    if fingerprint and fingerprint != cache.get('_token_fingerprint'):
+        # Токен изменился — сбрасываем TTL для немедленного обновления
+        cache['_api_cached_at'] = 0
+
     if time_module.time() - cache.get('_api_cached_at', 0) < API_CACHE_TTL:
         return False
 
@@ -220,6 +257,8 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict) ->
     try:
         creds = json.loads(credentials_path.read_text(encoding='utf-8'))
         token = creds['claudeAiOauth']['accessToken']
+        if fingerprint:
+            cache['_token_fingerprint'] = fingerprint
         result = subprocess.run(
             [
                 'curl', '-s', '--max-time', '5',
@@ -288,15 +327,23 @@ def main() -> None:
 
     # Контекстное окно: stdin → кеш
     ctx_pct: float | None = None
+    ctx_window_size: int | None = None
     ctx_node = stdin_data.get('context_window')
     if isinstance(ctx_node, dict):
         ctx_pct = ctx_node.get('used_percentage')
+        ctx_window_size = ctx_node.get('context_window_size')
 
     if ctx_pct is not None:
         cache['ctx_pct'] = ctx_pct
         cache_updated = True
     else:
         ctx_pct = cache.get('ctx_pct')
+
+    if ctx_window_size is not None:
+        cache['ctx_window_size'] = ctx_window_size
+        cache_updated = True
+    else:
+        ctx_window_size = cache.get('ctx_window_size')
 
     # Rate-limit бары: (field, token_pct, time_pct)
     bars: list[tuple[str, float | None, float | None]] = []
@@ -337,8 +384,25 @@ def main() -> None:
     bar_width      = max(8, remaining // n)
     last_bar_extra = remaining - bar_width * n
 
+    # Масштабируем ctx_pct относительно реально доступного окна (за вычетом буфера).
+    # В кеше остаётся сырое значение; корректировка только для рендера.
+    # Буфер autocompact — фиксированные 33k токенов. Процент зависит от размера окна:
+    # 200K → 16.5%, 1M → 3.3%. Если CLAUDE_AUTOCOMPACT_PCT_OVERRIDE задан,
+    # он определяет порог запуска (процент от окна), буфер = 100 - порог.
+    if _autocompact_pct_override is not None:
+        try:
+            buffer_pct = 100.0 - float(_autocompact_pct_override)
+        except ValueError:
+            buffer_pct = AUTOCOMPACT_BUFFER_TOKENS / (ctx_window_size or 200_000) * 100.0
+    else:
+        buffer_pct = AUTOCOMPACT_BUFFER_TOKENS / (ctx_window_size or 200_000) * 100.0
+
+    usable_pct = 100.0 - buffer_pct
+    ctx_display_pct = min(100.0, ctx_pct / usable_pct * 100.0) if ctx_pct is not None else None
+
     # Вывод
-    parts = [make_ctx_bar(ctx_pct, CTX_BAR_WIDTH)]
+    ctx_warn = ctx_display_pct is not None and ctx_display_pct >= 100.0
+    parts = [make_ctx_bar(ctx_display_pct, CTX_BAR_WIDTH, warn=ctx_warn)]
     for idx, (field, token_pct, time_pct) in enumerate(bars):
         width = bar_width + (last_bar_extra if idx == len(bars) - 1 else 0)
         parts.append(make_bar(token_pct, time_pct, width, get_label(field)))

@@ -10,7 +10,9 @@ A status bar script for [Claude Code](https://claude.ai/code) that visualizes co
 
 ### Context bar
 
-Shows how full the current conversation context window is. When it fills up, Claude Code automatically compresses the conversation history to free space.
+Shows how full the current conversation context window is. Claude Code reserves a fixed 33k-token autocompact buffer and automatically compresses the conversation history when that threshold is reached. The buffer percentage depends on the context window size: ~16.5% for 200k, ~3.3% for 1M.
+
+The bar scales to the usable portion of the window, so it reaches 100% exactly when autocompact is about to trigger. If the context has already entered the buffer zone, the bar turns **amber**.
 
 ### Rate limit bars
 
