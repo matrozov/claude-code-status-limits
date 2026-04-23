@@ -32,6 +32,11 @@ FIVE_HOUR_SECONDS = 5 * 3600
 SEVEN_DAY_SECONDS = 7 * 24 * 3600
 API_CACHE_TTL     = 300  # секунд
 
+# Запасная версия Claude Code для User-Agent, если stdin её не содержит и в кеше
+# тоже нет (например, первый запуск). Реальная версия приходит в stdin-JSON
+# в поле "version" и кешируется в status_limits_cache.json.
+FALLBACK_CLAUDE_VERSION = '2.1.81'
+
 # Размер буфера autocompact в токенах — фиксированная величина, не зависящая
 # от размера контекстного окна. Claude Code резервирует этот буфер и запускает
 # компрессию при достижении (context_window_size - AUTOCOMPACT_BUFFER_TOKENS).
@@ -42,8 +47,9 @@ AUTOCOMPACT_BUFFER_TOKENS: int = 33_000
 # как порог запуска компрессии (процент от окна), что неявно меняет размер буфера.
 _autocompact_pct_override: str | None = os.environ.get('CLAUDE_AUTOCOMPACT_PCT_OVERRIDE')
 
-# Поля, получаемые из stdin (не из API)
-STDIN_BAR_FIELDS = {'five_hour', 'seven_day'}
+# Поля, получаемые из stdin (не из API). Кортеж, чтобы фиксировать порядок
+# отображения базовых баров (5h перед 7d).
+STDIN_BAR_FIELDS: tuple[str, ...] = ('five_hour', 'seven_day')
 
 # ANSI-цвета
 FG_RESET      = '\033[0m'
@@ -61,31 +67,33 @@ BG_EMPTY      = '\033[48;2;55;55;55m'      # пусто (тёмно-серый)
 FG_CTX_FILLED = '\033[37m'                  # норма (серый)
 FG_CTX_WARN   = '\033[38;2;190;135;0m'      # превышен порог autocompact (янтарный)
 
-# Подписи баров — рендерятся поверх фона, поэтому могут быть длиннее
-LABEL_MAP = {
-    'context_window':       '',           # Ctx без подписи
-    'five_hour':            '5h',
-    'seven_day':            '7d',
-    'seven_day_sonnet':     'Sonnet 7d',
-    'seven_day_opus':       'Opus 7d',
-    'seven_day_oauth_apps': 'Apps 7d',
-    'seven_day_cowork':     'CoWork 7d',
-    'iguana_necktie':       'Iguana',
-}
-
-PERIOD_SECONDS = {
-    'five_hour':            FIVE_HOUR_SECONDS,
-    'seven_day':            SEVEN_DAY_SECONDS,
-    'seven_day_sonnet':     SEVEN_DAY_SECONDS,
-    'seven_day_opus':       SEVEN_DAY_SECONDS,
-    'seven_day_oauth_apps': SEVEN_DAY_SECONDS,
-    'seven_day_cowork':     SEVEN_DAY_SECONDS,
-    'iguana_necktie':       SEVEN_DAY_SECONDS,
+# Сопоставление префикса имени API-поля с (краткое обозначение периода, длительность в секундах).
+# Имя поля разбирается как <prefix>_<suffix>: префикс задаёт период, суффикс — название категории.
+# Поле без известного префикса игнорируется — мы не знаем, какой у него период,
+# и не можем корректно посчитать процент прошедшего времени.
+PERIOD_PREFIXES: dict[str, tuple[str, int]] = {
+    'five_hour': ('5h', FIVE_HOUR_SECONDS),
+    'seven_day': ('7d', SEVEN_DAY_SECONDS),
 }
 
 
-def get_label(field: str) -> str:
-    return LABEL_MAP.get(field, field.replace('_', ' ').title())
+def parse_field(field: str) -> tuple[str, int] | None:
+    """
+    Разбирает имя API-поля в (label, period_seconds).
+
+    - <prefix> без суффикса → подпись = только обозначение периода ('5h', '7d').
+    - <prefix>_<suffix>     → подпись = '<Suffix Title> <период>' (например, 'Sonnet 7d').
+    - неизвестный префикс  → None (поле пропускается рендером).
+
+    - field: имя поля API (например, 'seven_day_sonnet').
+    """
+    for prefix, (period_label, period_seconds) in PERIOD_PREFIXES.items():
+        if field == prefix:
+            return period_label, period_seconds
+        if field.startswith(prefix + '_'):
+            suffix = field[len(prefix) + 1:].replace('_', ' ').title()
+            return f'{suffix} {period_label}', period_seconds
+    return None
 
 
 def make_ctx_bar(percentage: float | None, width: int, warn: bool = False) -> str:
@@ -224,7 +232,7 @@ def _token_fingerprint(credentials_path: Path) -> str | None:
         return None
 
 
-def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict) -> bool:
+def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, claude_version: str) -> bool:
     """
     Обновляет cached_bars из OAuth usage API если истёк TTL (API_CACHE_TTL секунд)
     или если OAuth-токен изменился с момента последнего запроса.
@@ -241,6 +249,7 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict) ->
     - credentials_path: путь к файлу с OAuth-токеном
     - cache:            верхний уровень кеша (для хранения _api_cached_at)
     - cached_bars:      словарь баров для обновления
+    - claude_version:   версия Claude Code для подстановки в User-Agent
     """
     fingerprint = _token_fingerprint(credentials_path)
     if fingerprint and fingerprint != cache.get('_token_fingerprint'):
@@ -264,7 +273,7 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict) ->
                 'curl', '-s', '--max-time', '5',
                 '-H', f'x-api-key: {token}',
                 '-H', 'Accept: application/json',
-                '-H', 'User-Agent: Claude-Code/2.1.81',
+                '-H', f'User-Agent: Claude-Code/{claude_version}',
                 'https://claude.ai/api/oauth/usage',
             ],
             capture_output=True, text=True, timeout=6,
@@ -277,6 +286,12 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict) ->
             if utilization is None:
                 continue
             resets_at_iso = value.get('resets_at')
+            # Категория объявлена в API, но окно для пользователя не открыто
+            # и использования нет: бар бесполезен, скрываем, чтобы не занимать
+            # ширину у значимых баров. Появится автоматически, как только
+            # будет фактическое потребление или сервер откроет окно.
+            if utilization == 0 and resets_at_iso is None:
+                continue
             try:
                 resets_at_unix = int(datetime.fromisoformat(resets_at_iso).timestamp()) if resets_at_iso else None
             except (ValueError, OSError):
@@ -320,9 +335,20 @@ def main() -> None:
     cached_bars = cache.setdefault('bars', {})
     cache_updated = False
 
+    # Версия Claude Code для User-Agent: stdin → кеш → fallback. Claude Code
+    # передаёт актуальную версию в stdin-JSON каждым запуском statusLine,
+    # поэтому в нормальном режиме UA всегда соответствует текущему клиенту.
+    claude_version = stdin_data.get('version')
+    if claude_version:
+        if cache.get('claude_version') != claude_version:
+            cache['claude_version'] = claude_version
+            cache_updated = True
+    else:
+        claude_version = cache.get('claude_version') or FALLBACK_CLAUDE_VERSION
+
     # Обновляем API-бары если истёк TTL; API выполняется первым,
     # чтобы данные из stdin могли перекрыть пересекающиеся поля (five_hour, seven_day)
-    if maybe_refresh_api(home / '.claude/.credentials.json', cache, cached_bars):
+    if maybe_refresh_api(home / '.claude/.credentials.json', cache, cached_bars, claude_version):
         cache_updated = True
 
     # Контекстное окно: stdin → кеш
@@ -345,12 +371,12 @@ def main() -> None:
     else:
         ctx_window_size = cache.get('ctx_window_size')
 
-    # Rate-limit бары: (field, token_pct, time_pct)
+    # Rate-limit бары: (label, token_pct, time_pct)
     bars: list[tuple[str, float | None, float | None]] = []
 
     # five_hour и seven_day: stdin обновляет кеш и перекрывает данные из API
     rate_limits = stdin_data.get('rate_limits') or {}
-    for field, period in [('five_hour', FIVE_HOUR_SECONDS), ('seven_day', SEVEN_DAY_SECONDS)]:
+    for field in STDIN_BAR_FIELDS:
         window = rate_limits.get(field) or {}
         token_pct = window.get('used_percentage')
         resets_at = window.get('resets_at')
@@ -363,14 +389,22 @@ def main() -> None:
             token_pct = cached.get('token_pct')
             resets_at = cached.get('resets_at')
 
-        bars.append((field, token_pct, time_pct_from_unix(resets_at, period)))
+        parsed = parse_field(field)
+        if parsed is None:
+            continue
+        label, period = parsed
+        bars.append((label, token_pct, time_pct_from_unix(resets_at, period)))
 
-    # API-бары: все поля кеша кроме stdin-полей
+    # API-бары: все поля кеша кроме stdin-полей. Поля с неизвестным префиксом
+    # пропускаются: без известного периода нельзя посчитать time_pct.
     for field, bar_data in cached_bars.items():
         if field in STDIN_BAR_FIELDS:
             continue
-        period = PERIOD_SECONDS.get(field, SEVEN_DAY_SECONDS)
-        bars.append((field, bar_data.get('token_pct'), time_pct_from_unix(bar_data.get('resets_at'), period)))
+        parsed = parse_field(field)
+        if parsed is None:
+            continue
+        label, period = parsed
+        bars.append((label, bar_data.get('token_pct'), time_pct_from_unix(bar_data.get('resets_at'), period)))
 
     if cache_updated:
         write_cache(cache_path, cache)
@@ -403,9 +437,9 @@ def main() -> None:
     # Вывод
     ctx_warn = ctx_display_pct is not None and ctx_display_pct >= 100.0
     parts = [make_ctx_bar(ctx_display_pct, CTX_BAR_WIDTH, warn=ctx_warn)]
-    for idx, (field, token_pct, time_pct) in enumerate(bars):
+    for idx, (label, token_pct, time_pct) in enumerate(bars):
         width = bar_width + (last_bar_extra if idx == len(bars) - 1 else 0)
-        parts.append(make_bar(token_pct, time_pct, width, get_label(field)))
+        parts.append(make_bar(token_pct, time_pct, width, label))
 
     print(' '.join(parts))
 
