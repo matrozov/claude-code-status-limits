@@ -282,6 +282,59 @@ def release_lock(fd: int | None, lock_path: Path) -> None:
         pass
 
 
+def format_remaining(seconds: float) -> str:
+    """
+    Компактное представление оставшегося времени единым старшим разрядом:
+    Ns / Nm / Nh / Nd. Цель — однозначно передать порядок («осталось минуты,
+    а не часы») при минимальной ширине, чтобы приписка влезала даже в узкий
+    жёлтый сегмент бара.
+
+    Округление к ближайшему (round-to-nearest) с порогами «.5 единицы до
+    следующего разряда»: 89 sec → '1m', 90 sec → '2m', 23 h 40 min → '1d'.
+    Так избегаем артефактов вроде «задал ровно 3 дня, увидел 2d» из-за
+    микросекундной задержки между вычислением resets_at и time.time().
+
+    - seconds: оставшееся время в секундах (ожидается > 0)
+    """
+    seconds = max(0.0, seconds)
+    if seconds < 59.5:
+        return f'{round(seconds)}s'
+    minutes = seconds / 60
+    if minutes < 59.5:
+        return f'{round(minutes)}m'
+    hours = minutes / 60
+    if hours < 23.5:
+        return f'{round(hours)}h'
+    days = hours / 24
+    return f'{round(days)}d'
+
+
+def eta_label(label: str, token_pct: float | None, time_pct: float | None, resets_at: int | None) -> str:
+    """
+    Дописывает к подписи бара '(Nx left)' если расход токенов опережает время —
+    т.е. бар окрашен жёлтым. Это сигнал «жжёшь токены быстрее, чем течёт окно»;
+    оставшееся время до сброса даёт пользователю чёткий ориентир «сколько ещё терпеть».
+
+    Возвращает исходный label без изменений если:
+      - неизвестен token_pct, time_pct или resets_at,
+      - token_pct <= time_pct (бар не жёлтый — приписка не нужна),
+      - время сброса уже в прошлом (на границе периода до обновления данных).
+
+    - label:     базовая подпись бара (например, '7d')
+    - token_pct: процент использованных токенов (0–100 или None)
+    - time_pct:  процент прошедшего времени окна (0–100 или None)
+    - resets_at: unix-время сброса окна (или None)
+    """
+    if token_pct is None or time_pct is None or resets_at is None:
+        return label
+    if token_pct <= time_pct:
+        return label
+    remaining = resets_at - time_module.time()
+    if remaining <= 0:
+        return label
+    return f'{label} ({format_remaining(remaining)} left)'
+
+
 def _token_fingerprint(credentials_path: Path) -> str | None:
     """
     Возвращает короткий хэш OAuth-токена для отслеживания его смены.
@@ -417,8 +470,8 @@ def main() -> None:
         else:
             claude_version = cache.get('claude_version') or FALLBACK_CLAUDE_VERSION
 
-        # Обновляем API-бары если истёк TTL; API выполняется первым,
-        # чтобы данные из stdin могли перекрыть пересекающиеся поля (five_hour, seven_day)
+        # Обновляем API-бары если истёк TTL; API выполняется до обработки stdin
+        # rate_limits, чтобы данные из stdin могли перекрыть пересекающиеся поля.
         if maybe_refresh_api(home / '.claude/.credentials.json', cache, cached_bars, claude_version):
             cache_updated = True
 
@@ -442,9 +495,6 @@ def main() -> None:
         else:
             ctx_window_size = cache.get('ctx_window_size')
 
-        # Rate-limit бары: (label, token_pct, time_pct)
-        bars: list[tuple[str, float | None, float | None]] = []
-
         # five_hour и seven_day: stdin обновляет кеш и перекрывает данные из API
         rate_limits = stdin_data.get('rate_limits') or {}
         for field in STDIN_BAR_FIELDS:
@@ -455,16 +505,21 @@ def main() -> None:
             if token_pct is not None or resets_at is not None:
                 cached_bars[field] = {'token_pct': token_pct, 'resets_at': resets_at}
                 cache_updated = True
-            else:
-                cached = cached_bars.get(field) or {}
-                token_pct = cached.get('token_pct')
-                resets_at = cached.get('resets_at')
+
+        # Rate-limit бары: (label, token_pct, time_pct)
+        bars: list[tuple[str, float | None, float | None]] = []
+
+        for field in STDIN_BAR_FIELDS:
+            cached = cached_bars.get(field) or {}
+            token_pct = cached.get('token_pct')
+            resets_at = cached.get('resets_at')
 
             parsed = parse_field(field)
             if parsed is None:
                 continue
             label, period = parsed
-            bars.append((label, token_pct, time_pct_from_unix(resets_at, period)))
+            time_pct = time_pct_from_unix(resets_at, period)
+            bars.append((eta_label(label, token_pct, time_pct, resets_at), token_pct, time_pct))
 
         # API-бары: все поля кеша кроме stdin-полей. Поля с неизвестным префиксом
         # пропускаются: без известного периода нельзя посчитать time_pct.
@@ -475,7 +530,10 @@ def main() -> None:
             if parsed is None:
                 continue
             label, period = parsed
-            bars.append((label, bar_data.get('token_pct'), time_pct_from_unix(bar_data.get('resets_at'), period)))
+            token_pct = bar_data.get('token_pct')
+            resets_at = bar_data.get('resets_at')
+            time_pct = time_pct_from_unix(resets_at, period)
+            bars.append((eta_label(label, token_pct, time_pct, resets_at), token_pct, time_pct))
 
         if cache_updated:
             write_cache(cache_path, cache)
