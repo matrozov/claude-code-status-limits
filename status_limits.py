@@ -91,10 +91,8 @@ EFFORT_LABELS: dict[str, str] = {
 }
 
 # ANSI-цвета
-FG_RESET      = '\033[0m'
-FG_GRAY_DARK  = '\033[90m'
-FG_GRAY_LIGHT = '\033[37m'
-FG_LABEL      = '\033[38;2;255;255;255m'   # белый текст поверх фона баров
+FG_RESET = '\033[0m'
+FG_LABEL = '\033[38;2;255;255;255m'   # белый текст поверх фона баров
 
 # Фоновые цвета для четырёх состояний rate-limit баров
 BG_BOTH       = '\033[48;2;0;140;45m'      # токены + время (яркий зелёный)
@@ -370,18 +368,6 @@ def time_pct_from_unix(resets_at: int | None, period_seconds: int) -> float | No
     period_start = resets_at - period_seconds
     elapsed = time_module.time() - period_start
     return max(0.0, min(elapsed / period_seconds * 100.0, 100.0))
-
-
-def time_pct_from_iso(resets_at_str: str | None, period_seconds: int) -> float | None:
-    if not resets_at_str:
-        return None
-    try:
-        resets_at = datetime.fromisoformat(resets_at_str).timestamp()
-        period_start = resets_at - period_seconds
-        elapsed = time_module.time() - period_start
-        return max(0.0, min(elapsed / period_seconds * 100.0, 100.0))
-    except (ValueError, OSError):
-        return None
 
 
 def iso_to_unix(iso: str | None) -> int | None:
