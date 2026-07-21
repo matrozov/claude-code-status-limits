@@ -176,6 +176,16 @@ PERIOD_PREFIXES: dict[str, tuple[str, int]] = {
     'seven_day': ('7d', SEVEN_DAY_SECONDS),
 }
 
+# Сопоставление поля group записи массива limits (новый формат usage API)
+# с префиксом имени поля бара. Через префикс scoped-запись превращается в
+# синтетическое имя вида 'seven_day_fable', которое дальше обрабатывается
+# существующим parse_field. Запись с неизвестной группой пропускается —
+# неизвестен период окна.
+LIMIT_GROUP_PREFIXES: dict[str, str] = {
+    'session': 'five_hour',
+    'weekly':  'seven_day',
+}
+
 
 def bg_escape(rgb: tuple[int, int, int]) -> str:
     """ANSI-код true-color фона."""
@@ -370,6 +380,22 @@ def time_pct_from_iso(resets_at_str: str | None, period_seconds: int) -> float |
         period_start = resets_at - period_seconds
         elapsed = time_module.time() - period_start
         return max(0.0, min(elapsed / period_seconds * 100.0, 100.0))
+    except (ValueError, OSError):
+        return None
+
+
+def iso_to_unix(iso: str | None) -> int | None:
+    """
+    Переводит ISO-время в unix-секунды.
+
+    Возвращает None для пустого значения или непарсибельной строки.
+
+    - iso: время в формате ISO 8601 (или None)
+    """
+    if not iso:
+        return None
+    try:
+        return int(datetime.fromisoformat(iso).timestamp())
     except (ValueError, OSError):
         return None
 
@@ -625,10 +651,17 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, cl
     Обновляет cached_bars из OAuth usage API если истёк TTL (API_CACHE_TTL секунд)
     или если OAuth-токен изменился с момента последнего запроса.
 
+    Разбирает два формата ответа: плоские поля верхнего уровня со словарём
+    {utilization, resets_at} (старый формат) и массив limits со scoped-записями
+    по конкретным моделям (новый формат; например, недельный лимит Fable).
+
     Перед попыткой запроса очищает все API-бары из cached_bars. На успехе заполняет
     актуальными данными. На любой ошибке (недоступен API, ошибка авторизации, таймаут)
     бары остаются пустыми — устаревшие данные не отображаются. TTL обновляется в обоих
     случаях, чтобы не повторять запрос при каждом ходу.
+
+    Побочный эффект: пишет в cache флаг _api_error (True — последняя попытка
+    обновления провалилась), по которому рендер показывает алерт '!API'.
 
     Возвращает True если кеш был изменён, False если TTL ещё не истёк.
 
@@ -659,7 +692,7 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, cl
         result = subprocess.run(
             [
                 'curl', '-s', '--max-time', '5',
-                '-H', f'x-api-key: {token}',
+                '-H', f'Authorization: Bearer {token}',
                 '-H', 'Accept: application/json',
                 '-H', f'User-Agent: Claude-Code/{claude_version}',
                 'https://claude.ai/api/oauth/usage',
@@ -667,6 +700,11 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, cl
             capture_output=True, text=True, timeout=6,
         )
         data = json.loads(result.stdout)
+        # API-ошибки (протухший токен, смена схемы авторизации) приходят валидным
+        # JSON вида {"type": "error", ...} — без явной проверки они выглядели бы
+        # как «успех без баров», и поломка синхронизации оставалась бы незамеченной.
+        if not isinstance(data, dict) or data.get('type') == 'error':
+            raise ValueError('usage API вернул ошибку')
         for field, value in data.items():
             if not isinstance(value, dict):
                 continue
@@ -680,13 +718,32 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, cl
             # будет фактическое потребление или сервер откроет окно.
             if utilization == 0 and resets_at_iso is None:
                 continue
-            try:
-                resets_at_unix = int(datetime.fromisoformat(resets_at_iso).timestamp()) if resets_at_iso else None
-            except (ValueError, OSError):
-                resets_at_unix = None
-            cached_bars[field] = {'token_pct': utilization, 'resets_at': resets_at_unix}
+            cached_bars[field] = {'token_pct': utilization, 'resets_at': iso_to_unix(resets_at_iso)}
+        # Scoped-лимиты из массива limits (новый формат API): например, недельный
+        # лимит конкретной модели (Fable). Записи без scope пропускаются — это
+        # агрегаты session / weekly_all, дублирующие stdin-бары five_hour/seven_day.
+        for entry in data.get('limits') or []:
+            if not isinstance(entry, dict):
+                continue
+            prefix = LIMIT_GROUP_PREFIXES.get(entry.get('group'))
+            scope = entry.get('scope')
+            percent = entry.get('percent')
+            if prefix is None or percent is None or not isinstance(scope, dict):
+                continue
+            model_scope = scope.get('model')
+            display_name = model_scope.get('display_name') if isinstance(model_scope, dict) else None
+            if not display_name:
+                continue
+            resets_at_iso = entry.get('resets_at')
+            # То же правило скрытия, что и у плоских полей: лимит объявлен,
+            # но окно не открыто и расхода нет.
+            if percent == 0 and resets_at_iso is None:
+                continue
+            field = f'{prefix}_{display_name.lower().replace(" ", "_")}'
+            cached_bars[field] = {'token_pct': percent, 'resets_at': iso_to_unix(resets_at_iso)}
+        cache['_api_error'] = False
     except Exception:
-        pass
+        cache['_api_error'] = True
     finally:
         cache['_api_cached_at'] = time_module.time()
 
@@ -887,13 +944,14 @@ def main() -> None:
     default_window = split_model_window(default_model)[1] if default_model else None
     ctx_differs = bool(default_window and ctx_window_size and ctx_window_size < default_window)
 
-    # Суффикс справа от баров: "!Opus 4.7 ⚡! [1m] !xH! !DEF" — имя модели
+    # Суффикс справа от баров: "!Opus 4.7 ⚡! [1m] !xH! !DEF !API" — имя модели
     # (с молнией, если включён fast mode), размер контекстного окна числом и
     # короткий ярлык effort; маркеры '!' в паддинг-ячейках бейджа — значение
     # отличается от глобального дефолта, при хотя бы одном отличии в конце
-    # дописывается красный '!DEF'. Любой компонент может отсутствовать.
-    # Имя модели и effort окрашиваются фоном по категории
-    # (Haiku/Sonnet/Opus/Fable, L/M/H/xH); бейдж размера окна — нейтральный серый.
+    # дописывается красный '!DEF'; красный '!API' — последняя попытка обновить
+    # usage API провалилась. Любой компонент может отсутствовать. Имя модели и
+    # effort окрашиваются фоном по категории (Haiku/Sonnet/Opus/Fable, L/M/H/xH);
+    # бейдж размера окна — нейтральный серый.
     # Параллельно копим plain-варианты сегментов: они нужны для расчёта
     # видимой ширины (ANSI-коды в len() не годятся).
     model_info_rendered_parts: list[str] = []
@@ -934,6 +992,13 @@ def main() -> None:
     if model_differs or ctx_differs or effort_differs:
         model_info_rendered_parts.append(f' {fg_escape(RGB_ALERT)}!DEF{FG_RESET}')
         model_info_plain_parts.append(' !DEF')
+
+    # Текстовый алерт «не удалось обновить данные usage API»: красный '!API'.
+    # Без него ошибка синхронизации неотличима от «просто нет дополнительных
+    # баров», и пропажу API-лимитов легко долго не замечать.
+    if cache.get('_api_error'):
+        model_info_rendered_parts.append(f' {fg_escape(RGB_ALERT)}!API{FG_RESET}')
+        model_info_plain_parts.append(' !API')
 
     # Сегменты склеиваются без пробелов-разделителей: у каждого бейджа уже
     # есть свои внутренние паддинги, сплошной ряд смотрится как единый блок.
