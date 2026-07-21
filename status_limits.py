@@ -27,7 +27,13 @@ from pathlib import Path
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-CTX_BAR_WIDTH     = 6
+# Контекстный бар адаптируется под размер окна модели: один символ покрывает
+# CTX_TOKENS_PER_CHAR токенов, что даёт стабильную «цену деления» независимо
+# от окна. При 50_000 токенов/символ типичный шаг 150k всегда занимает ≈3
+# символа: 200k → 4, 500k → 10, 1M → 20. CTX_BAR_MIN_WIDTH страхует на случай
+# очень маленьких окон, чтобы бар оставался читаемым.
+CTX_TOKENS_PER_CHAR = 50_000
+CTX_BAR_MIN_WIDTH   = 6
 FIVE_HOUR_SECONDS = 5 * 3600
 SEVEN_DAY_SECONDS = 7 * 24 * 3600
 API_CACHE_TTL     = 300  # секунд
@@ -51,6 +57,20 @@ FALLBACK_CLAUDE_VERSION = '2.1.81'
 # Для 200K окна буфер ≈ 16.5%, для 1M — ≈ 3.3%.
 AUTOCOMPACT_BUFFER_TOKENS: int = 33_000
 
+# Порог «дорогого» контекста в токенах. Сам Claude Code в своих сообщениях
+# выделяет границу >150K (например, "71% of your usage was at >150k context"),
+# и это намёк, что выше этого значения применяются повышенные тарифы / нагрузка.
+# Переходя порог, контекстный бар окрашивается в янтарный — тот же сигнал,
+# что и при входе в autocompact-буфер.
+CTX_AMBER_THRESHOLD_TOKENS: int = 150_000
+
+# Порог «опасного» контекста — двойное превышение янтарного. На больших окнах
+# (400K+ и тем более 1M) autocompact срабатывает очень поздно, поэтому без
+# отдельного сигнала легко не заметить, что контекст давно вышел за разумный
+# по стоимости/задержке размер. Превышение даёт красный, который имеет приоритет
+# над янтарным.
+CTX_RED_THRESHOLD_TOKENS: int = CTX_AMBER_THRESHOLD_TOKENS * 2
+
 # Если установлена CLAUDE_AUTOCOMPACT_PCT_OVERRIDE, Claude Code использует её
 # как порог запуска компрессии (процент от окна), что неявно меняет размер буфера.
 _autocompact_pct_override: str | None = os.environ.get('CLAUDE_AUTOCOMPACT_PCT_OVERRIDE')
@@ -71,9 +91,19 @@ BG_TIME_ONLY  = '\033[48;2;0;80;22m'       # только время (тёмно
 BG_TOKEN_ONLY = '\033[48;2;190;135;0m'     # только токены (янтарный)
 BG_EMPTY      = '\033[48;2;55;55;55m'      # пусто (тёмно-серый)
 
-# Цвета заполненной части контекстного бара
-FG_CTX_FILLED = '\033[37m'                  # норма (серый)
-FG_CTX_WARN   = '\033[38;2;190;135;0m'      # превышен порог autocompact (янтарный)
+# Палитра контекстного бара.
+# Заливка использует один цвет на весь бар (выбирается по уровню тревоги:
+# нейтральный/янтарный/красный). Пустая часть подсвечена «зональным» фоном,
+# отражающим близость к порогам срабатывания: до CTX_AMBER_THRESHOLD_TOKENS
+# фон нейтрально-серый, между янтарным и красным порогом — с лёгким тёплым
+# оттенком, после красного — с лёгким красноватым. Тинты подобраны очень
+# слабыми (~ту же светлоту, что у нейтрального BG_EMPTY=(55,55,55)), чтобы
+# не «зашумлять» бар, но позволять оценить удалённость до следующей границы.
+FG_CTX_FILLED   = '\033[38;2;192;192;192m'  # норма, заливка серая
+FG_CTX_WARN     = '\033[38;2;190;135;0m'    # warn, заливка янтарная
+FG_CTX_DANGER   = '\033[38;2;150;35;35m'    # danger, заливка красная
+BG_EMPTY_AMBER  = '\033[48;2;65;47;16m'     # пусто, зона 150–300k токенов (приглушённый янтарный)
+BG_EMPTY_DANGER = '\033[48;2;64;28;28m'     # пусто, зона >300k токенов (приглушённый красный)
 
 # Сопоставление префикса имени API-поля с (краткое обозначение периода, длительность в секундах).
 # Имя поля разбирается как <prefix>_<suffix>: префикс задаёт период, суффикс — название категории.
@@ -104,42 +134,80 @@ def parse_field(field: str) -> tuple[str, int] | None:
     return None
 
 
-def make_ctx_bar(percentage: float | None, width: int, warn: bool = False) -> str:
+def make_ctx_bar(
+    percentage: float | None,
+    width: int,
+    level: str = 'normal',
+    amber_at: float | None = None,
+    danger_at: float | None = None,
+) -> str:
     """
     Бар контекстного окна с субсимвольным краем через восьмушки, без подписи.
+    Заливка одноцветная (по уровню тревоги). Фон пустых ячеек тонирован зонами,
+    показывая, насколько далеко до следующей границы срабатывания цвета.
 
     - percentage: процент заполненности (0–100 или None); значения >100 обрезаются до 100
     - width:      ширина бара в символах
-    - warn:       если True — заполненная часть рисуется янтарным (контекст вошёл в буфер autocompact)
+    - level:      уровень тревоги для заполненной части:
+                    'normal' — серая,
+                    'warn'   — янтарная (вход в autocompact или > CTX_AMBER_THRESHOLD_TOKENS),
+                    'danger' — красная (> CTX_RED_THRESHOLD_TOKENS).
+                  Неизвестное значение трактуется как 'normal'.
+    - amber_at:   позиция (в долях символа) перехода фона в янтарный тинт; None — без зоны
+    - danger_at:  позиция (в долях символа) перехода фона в красноватый тинт; None — без зоны
     """
-    if percentage is None:
-        return f'{BG_EMPTY}{" " * width}{FG_RESET}'
-
-    color      = FG_CTX_WARN if warn else FG_GRAY_LIGHT
-    percentage = min(100.0, percentage)
-    fill_exact = percentage / 100.0 * width
-    full_cells = int(fill_exact)
-    remainder  = fill_exact - full_cells
-
-    cells = []
-    if full_cells > 0:
-        cells.append(f'{color}{"█" * full_cells}{FG_RESET}')
-
-    if full_cells < width and remainder > 0:
-        eighth_index = max(0, round(remainder * 8) - 1)
-        cells.append(f'{BG_EMPTY}{color}{"▏▎▍▌▋▊▉█"[eighth_index]}{FG_RESET}')
-        empty_start = full_cells + 1
+    if level == 'danger':
+        fg = FG_CTX_DANGER
+    elif level == 'warn':
+        fg = FG_CTX_WARN
     else:
-        empty_start = full_cells
+        fg = FG_CTX_FILLED
 
-    empty_count = width - empty_start
-    if empty_count > 0:
-        cells.append(f'{BG_EMPTY}{" " * empty_count}{FG_RESET}')
+    # None трактуем как «процент неизвестен» — рисуем только пустой фон с зонами.
+    if percentage is None:
+        full_cells   = 0
+        eighth_char: str | None = None
+    else:
+        percentage = min(100.0, percentage)
+        fill_exact = percentage / 100.0 * width
+        full_cells = int(fill_exact)
+        remainder  = fill_exact - full_cells
+        if full_cells < width and remainder > 0:
+            eighth_char = '▏▎▍▌▋▊▉█'[max(0, round(remainder * 8) - 1)]
+        else:
+            eighth_char = None
+
+    cells: list[str] = []
+    for i in range(width):
+        # Зональный фон: в какой диапазон попадает середина ячейки i.
+        # Используем (i + 0.5), чтобы граница ложилась между символами,
+        # а не отрезала первую ячейку зоны раньше времени.
+        cell_center = i + 0.5
+        if danger_at is not None and cell_center >= danger_at:
+            bg = BG_EMPTY_DANGER
+        elif amber_at is not None and cell_center >= amber_at:
+            bg = BG_EMPTY_AMBER
+        else:
+            bg = BG_EMPTY
+
+        if i < full_cells:
+            # Полная ячейка: BG не виден за █, но указываем для случая, если
+            # терминал склеит соседние пустые/полные сегменты.
+            cells.append(f'{bg}{fg}█{FG_RESET}')
+        elif eighth_char is not None and i == full_cells:
+            cells.append(f'{bg}{fg}{eighth_char}{FG_RESET}')
+        else:
+            cells.append(f'{bg} {FG_RESET}')
 
     return ''.join(cells)
 
 
-def make_bar(token_pct: float | None, time_pct: float | None, width: int, label: str = '') -> str:
+def make_bar(
+    token_pct: float | None,
+    time_pct: float | None,
+    width: int,
+    label: str = '',
+) -> str:
     """
     Двойной бар с подписью поверх фона.
 
@@ -542,10 +610,18 @@ def main() -> None:
 
     # Адаптивная ширина.
     # Итоговая строка: ctx_bar + N_bars×bar + N_bars×separator(1)
-    # → bar_width = (terminal_width - CTX_BAR_WIDTH - N) / N
+    # → bar_width = (terminal_width - ctx_bar_width - N) / N
+    # ctx_bar_width зависит от размера контекстного окна модели: один символ
+    # покрывает CTX_TOKENS_PER_CHAR токенов, поэтому 150k токенов всегда
+    # выглядят одной и той же шириной независимо от окна. ceil-деление через
+    # (-(-a // b)) — без импорта math.
     terminal_width = _get_terminal_width()
     n              = max(1, len(bars))
-    remaining      = terminal_width - CTX_BAR_WIDTH - n * 1
+    if ctx_window_size:
+        ctx_bar_width = max(CTX_BAR_MIN_WIDTH, -(-ctx_window_size // CTX_TOKENS_PER_CHAR))
+    else:
+        ctx_bar_width = CTX_BAR_MIN_WIDTH
+    remaining      = terminal_width - ctx_bar_width - n * 1
     bar_width      = max(8, remaining // n)
     last_bar_extra = remaining - bar_width * n
 
@@ -565,9 +641,39 @@ def main() -> None:
     usable_pct = 100.0 - buffer_pct
     ctx_display_pct = min(100.0, ctx_pct / usable_pct * 100.0) if ctx_pct is not None else None
 
-    # Вывод
-    ctx_warn = ctx_display_pct is not None and ctx_display_pct >= 100.0
-    parts = [make_ctx_bar(ctx_display_pct, CTX_BAR_WIDTH, warn=ctx_warn)]
+    # Вывод. Цвет заполненной части бара выбирается по трёхуровневой эскалации:
+    #   danger (красный) — контекст превысил CTX_RED_THRESHOLD_TOKENS (300k);
+    #   warn   (янтарный) — контекст вошёл в autocompact-буфер ИЛИ превысил
+    #                       CTX_AMBER_THRESHOLD_TOKENS (150k);
+    #   normal (серый)    — всё остальное.
+    # Приоритет: danger > warn > normal.
+    ctx_tokens = (ctx_pct / 100.0 * ctx_window_size) if (ctx_pct is not None and ctx_window_size) else None
+    if ctx_tokens is not None and ctx_tokens >= CTX_RED_THRESHOLD_TOKENS:
+        ctx_level = 'danger'
+    elif (
+        (ctx_display_pct is not None and ctx_display_pct >= 100.0)
+        or (ctx_tokens is not None and ctx_tokens >= CTX_AMBER_THRESHOLD_TOKENS)
+    ):
+        ctx_level = 'warn'
+    else:
+        ctx_level = 'normal'
+
+    # Позиции зональных границ фона. Вычисляем из реальной «цены деления»
+    # (usable_tokens / ctx_bar_width), а не из CTX_TOKENS_PER_CHAR — так фон
+    # переключается ровно там, где сработает соответствующий уровень цвета.
+    # Если окно неизвестно или порог за пределами бара — зону не рисуем.
+    if ctx_window_size:
+        usable_tokens   = ctx_window_size * usable_pct / 100.0
+        tokens_per_char = usable_tokens / ctx_bar_width
+        amber_at  = CTX_AMBER_THRESHOLD_TOKENS / tokens_per_char if tokens_per_char > 0 else None
+        danger_at = CTX_RED_THRESHOLD_TOKENS   / tokens_per_char if tokens_per_char > 0 else None
+    else:
+        amber_at = danger_at = None
+
+    parts: list[str] = [
+        make_ctx_bar(ctx_display_pct, ctx_bar_width, level=ctx_level,
+                     amber_at=amber_at, danger_at=danger_at)
+    ]
     for idx, (label, token_pct, time_pct) in enumerate(bars):
         width = bar_width + (last_bar_extra if idx == len(bars) - 1 else 0)
         parts.append(make_bar(token_pct, time_pct, width, label))
