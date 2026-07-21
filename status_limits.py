@@ -32,6 +32,14 @@ FIVE_HOUR_SECONDS = 5 * 3600
 SEVEN_DAY_SECONDS = 7 * 24 * 3600
 API_CACHE_TTL     = 300  # секунд
 
+# Параметры межпроцессного лока на кеш-файл. Лок берётся через O_CREAT|O_EXCL
+# — единственный кроссплатформенный без зависимостей способ. LOCK_TIMEOUT
+# страхует от мёртвых локов (процесс упал, не освободив): если файл-лок
+# старше этого значения, считаем его просроченным и перезахватываем.
+LOCK_TIMEOUT          = 5.0    # секунд — после этого лок считается мёртвым
+LOCK_ACQUIRE_TIMEOUT  = 2.0    # секунд — сколько ждать на захват
+LOCK_RETRY_INTERVAL   = 0.05   # секунд между попытками
+
 # Запасная версия Claude Code для User-Agent, если stdin её не содержит и в кеше
 # тоже нет (например, первый запуск). Реальная версия приходит в stdin-JSON
 # в поле "version" и кешируется в status_limits_cache.json.
@@ -210,9 +218,66 @@ def read_cache(cache_path: Path) -> dict:
 
 
 def write_cache(cache_path: Path, cache: dict) -> None:
-    """Записывает кеш состояния баров на диск, игнорируя ошибки."""
+    """
+    Атомарно записывает кеш на диск через write-to-tmp + os.replace.
+
+    Атомарность важна, так как кеш разделяется между параллельными
+    процессами Claude Code — без неё читатель может увидеть полузаписанный JSON.
+    Любые ошибки ввода-вывода игнорируются: кеш не критичен, восстановится
+    на следующем запуске.
+    """
     try:
-        cache_path.write_text(json.dumps(cache), encoding='utf-8')
+        tmp_path = cache_path.with_suffix(cache_path.suffix + '.tmp')
+        tmp_path.write_text(json.dumps(cache), encoding='utf-8')
+        os.replace(str(tmp_path), str(cache_path))
+    except OSError:
+        pass
+
+
+def acquire_lock(lock_path: Path) -> int | None:
+    """
+    Захватывает межпроцессный лок созданием эксклюзивного файла O_CREAT|O_EXCL.
+
+    Если файл-лок уже существует, ждёт его освобождения до LOCK_ACQUIRE_TIMEOUT.
+    Если существующий лок старше LOCK_TIMEOUT — считает его мёртвым (процесс
+    упал, не освободив) и перезахватывает.
+
+    Возвращает file descriptor лока (для последующего release_lock) или None
+    при таймауте — в этом случае работаем без лока, рискуя потерять одну дельту.
+
+    - lock_path: путь к файлу-локу
+    """
+    deadline = time_module.monotonic() + LOCK_ACQUIRE_TIMEOUT
+    while True:
+        try:
+            return os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        except FileExistsError:
+            try:
+                age = time_module.time() - lock_path.stat().st_mtime
+                if age > LOCK_TIMEOUT:
+                    try:
+                        lock_path.unlink()
+                        continue
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+            if time_module.monotonic() >= deadline:
+                return None
+            time_module.sleep(LOCK_RETRY_INTERVAL)
+        except OSError:
+            return None
+
+
+def release_lock(fd: int | None, lock_path: Path) -> None:
+    """Освобождает лок, закрывая дескриптор и удаляя файл."""
+    if fd is not None:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    try:
+        lock_path.unlink()
     except OSError:
         pass
 
@@ -331,83 +396,91 @@ def main() -> None:
 
     home = Path.home()
     cache_path = home / '.claude/status_limits_cache.json'
-    cache = read_cache(cache_path)
-    cached_bars = cache.setdefault('bars', {})
-    cache_updated = False
+    lock_path  = home / '.claude/status_limits_cache.json.lock'
 
-    # Версия Claude Code для User-Agent: stdin → кеш → fallback. Claude Code
-    # передаёт актуальную версию в stdin-JSON каждым запуском statusLine,
-    # поэтому в нормальном режиме UA всегда соответствует текущему клиенту.
-    claude_version = stdin_data.get('version')
-    if claude_version:
-        if cache.get('claude_version') != claude_version:
-            cache['claude_version'] = claude_version
+    # Все операции с кешем — под общим локом. Несколько параллельных процессов
+    # Claude Code делят один кеш; лок страхует от race condition при записи.
+    lock_fd = acquire_lock(lock_path)
+    try:
+        cache = read_cache(cache_path)
+        cached_bars     = cache.setdefault('bars', {})
+        cache_updated = False
+
+        # Версия Claude Code для User-Agent: stdin → кеш → fallback. Claude Code
+        # передаёт актуальную версию в stdin-JSON каждым запуском statusLine,
+        # поэтому в нормальном режиме UA всегда соответствует текущему клиенту.
+        claude_version = stdin_data.get('version')
+        if claude_version:
+            if cache.get('claude_version') != claude_version:
+                cache['claude_version'] = claude_version
+                cache_updated = True
+        else:
+            claude_version = cache.get('claude_version') or FALLBACK_CLAUDE_VERSION
+
+        # Обновляем API-бары если истёк TTL; API выполняется первым,
+        # чтобы данные из stdin могли перекрыть пересекающиеся поля (five_hour, seven_day)
+        if maybe_refresh_api(home / '.claude/.credentials.json', cache, cached_bars, claude_version):
             cache_updated = True
-    else:
-        claude_version = cache.get('claude_version') or FALLBACK_CLAUDE_VERSION
 
-    # Обновляем API-бары если истёк TTL; API выполняется первым,
-    # чтобы данные из stdin могли перекрыть пересекающиеся поля (five_hour, seven_day)
-    if maybe_refresh_api(home / '.claude/.credentials.json', cache, cached_bars, claude_version):
-        cache_updated = True
+        # Контекстное окно: stdin → кеш
+        ctx_pct: float | None = None
+        ctx_window_size: int | None = None
+        ctx_node = stdin_data.get('context_window')
+        if isinstance(ctx_node, dict):
+            ctx_pct = ctx_node.get('used_percentage')
+            ctx_window_size = ctx_node.get('context_window_size')
 
-    # Контекстное окно: stdin → кеш
-    ctx_pct: float | None = None
-    ctx_window_size: int | None = None
-    ctx_node = stdin_data.get('context_window')
-    if isinstance(ctx_node, dict):
-        ctx_pct = ctx_node.get('used_percentage')
-        ctx_window_size = ctx_node.get('context_window_size')
-
-    if ctx_pct is not None:
-        cache['ctx_pct'] = ctx_pct
-        cache_updated = True
-    else:
-        ctx_pct = cache.get('ctx_pct')
-
-    if ctx_window_size is not None:
-        cache['ctx_window_size'] = ctx_window_size
-        cache_updated = True
-    else:
-        ctx_window_size = cache.get('ctx_window_size')
-
-    # Rate-limit бары: (label, token_pct, time_pct)
-    bars: list[tuple[str, float | None, float | None]] = []
-
-    # five_hour и seven_day: stdin обновляет кеш и перекрывает данные из API
-    rate_limits = stdin_data.get('rate_limits') or {}
-    for field in STDIN_BAR_FIELDS:
-        window = rate_limits.get(field) or {}
-        token_pct = window.get('used_percentage')
-        resets_at = window.get('resets_at')
-
-        if token_pct is not None or resets_at is not None:
-            cached_bars[field] = {'token_pct': token_pct, 'resets_at': resets_at}
+        if ctx_pct is not None:
+            cache['ctx_pct'] = ctx_pct
             cache_updated = True
         else:
-            cached = cached_bars.get(field) or {}
-            token_pct = cached.get('token_pct')
-            resets_at = cached.get('resets_at')
+            ctx_pct = cache.get('ctx_pct')
 
-        parsed = parse_field(field)
-        if parsed is None:
-            continue
-        label, period = parsed
-        bars.append((label, token_pct, time_pct_from_unix(resets_at, period)))
+        if ctx_window_size is not None:
+            cache['ctx_window_size'] = ctx_window_size
+            cache_updated = True
+        else:
+            ctx_window_size = cache.get('ctx_window_size')
 
-    # API-бары: все поля кеша кроме stdin-полей. Поля с неизвестным префиксом
-    # пропускаются: без известного периода нельзя посчитать time_pct.
-    for field, bar_data in cached_bars.items():
-        if field in STDIN_BAR_FIELDS:
-            continue
-        parsed = parse_field(field)
-        if parsed is None:
-            continue
-        label, period = parsed
-        bars.append((label, bar_data.get('token_pct'), time_pct_from_unix(bar_data.get('resets_at'), period)))
+        # Rate-limit бары: (label, token_pct, time_pct)
+        bars: list[tuple[str, float | None, float | None]] = []
 
-    if cache_updated:
-        write_cache(cache_path, cache)
+        # five_hour и seven_day: stdin обновляет кеш и перекрывает данные из API
+        rate_limits = stdin_data.get('rate_limits') or {}
+        for field in STDIN_BAR_FIELDS:
+            window = rate_limits.get(field) or {}
+            token_pct = window.get('used_percentage')
+            resets_at = window.get('resets_at')
+
+            if token_pct is not None or resets_at is not None:
+                cached_bars[field] = {'token_pct': token_pct, 'resets_at': resets_at}
+                cache_updated = True
+            else:
+                cached = cached_bars.get(field) or {}
+                token_pct = cached.get('token_pct')
+                resets_at = cached.get('resets_at')
+
+            parsed = parse_field(field)
+            if parsed is None:
+                continue
+            label, period = parsed
+            bars.append((label, token_pct, time_pct_from_unix(resets_at, period)))
+
+        # API-бары: все поля кеша кроме stdin-полей. Поля с неизвестным префиксом
+        # пропускаются: без известного периода нельзя посчитать time_pct.
+        for field, bar_data in cached_bars.items():
+            if field in STDIN_BAR_FIELDS:
+                continue
+            parsed = parse_field(field)
+            if parsed is None:
+                continue
+            label, period = parsed
+            bars.append((label, bar_data.get('token_pct'), time_pct_from_unix(bar_data.get('resets_at'), period)))
+
+        if cache_updated:
+            write_cache(cache_path, cache)
+    finally:
+        release_lock(lock_fd, lock_path)
 
     # Адаптивная ширина.
     # Итоговая строка: ctx_bar + N_bars×bar + N_bars×separator(1)
