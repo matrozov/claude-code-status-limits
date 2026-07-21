@@ -79,6 +79,17 @@ _autocompact_pct_override: str | None = os.environ.get('CLAUDE_AUTOCOMPACT_PCT_O
 # отображения базовых баров (5h перед 7d).
 STDIN_BAR_FIELDS: tuple[str, ...] = ('five_hour', 'seven_day')
 
+# Короткие ярлыки для уровня thinking-effort из stdin (поле effort.level).
+# Отсутствующий в словаре уровень не показывается — лучше не врать, чем показывать
+# угадку, если Anthropic добавит новый уровень.
+EFFORT_LABELS: dict[str, str] = {
+    'low':    'L',
+    'medium': 'M',
+    'high':   'H',
+    'xhigh':  'xH',
+    'max':    'M',
+}
+
 # ANSI-цвета
 FG_RESET      = '\033[0m'
 FG_GRAY_DARK  = '\033[90m'
@@ -101,9 +112,60 @@ BG_EMPTY      = '\033[48;2;55;55;55m'      # пусто (тёмно-серый)
 # не «зашумлять» бар, но позволять оценить удалённость до следующей границы.
 FG_CTX_FILLED   = '\033[38;2;192;192;192m'  # норма, заливка серая
 FG_CTX_WARN     = '\033[38;2;190;135;0m'    # warn, заливка янтарная
-FG_CTX_DANGER   = '\033[38;2;150;35;35m'    # danger, заливка красная
+FG_CTX_DANGER   = '\033[38;2;150;35;35m'    # danger, заливка красная (тот же оттенок, что у TIER_RGB[3])
 BG_EMPTY_AMBER  = '\033[48;2;65;47;16m'     # пусто, зона 150–300k токенов (приглушённый янтарный)
 BG_EMPTY_DANGER = '\033[48;2;64;28;28m'     # пусто, зона >300k токенов (приглушённый красный)
+
+# Единая 4-уровневая шкала фоновых цветов «slate → green → amber → red».
+# Применяется и к категориям моделей, и к уровням effort: Unknown ≡ L (slate),
+# Haiku ≡ M (green), Sonnet ≡ H (amber), Opus/Fable ≡ xH (red). Один и тот же
+# уровень интенсивности на обеих осях окрашивается одинаково — взгляд сразу
+# видит «насколько мощно/энергично». Палитра отличается от rate-limit баров
+# (тёмно-серый пустого участка), чтобы блок «модель/контекст/effort»
+# визуально отделялся от баров.
+# Хранится RGB-кортежами, а не готовыми ANSI-кодами: из цвета фона дополнительно
+# вычисляется цвет маркера отличия от дефолта (смесь белого с фоном,
+# доля белого — MARKER_WHITE_ALPHA).
+TIER_RGB: tuple[tuple[int, int, int], ...] = (
+    (80, 90, 100),   # 0: slate
+    (40, 110, 70),   # 1: green
+    (190, 130, 0),   # 2: amber
+    (150, 35, 35),   # 3: red (тот же оттенок, что у FG_CTX_DANGER)
+)
+
+# Фон для неизвестной модели и нейтральных бейджей (например, размера контекста).
+# Совпадает с уровнем 0 шкалы, чтобы Unknown визуально стыковался с L.
+RGB_UNKNOWN = TIER_RGB[0]
+
+# Сопоставление подстроки в имени модели с цветом фона бейджа.
+# Подстроки берутся в нижнем регистре; имя модели матчится через `.lower()`.
+MODEL_TIER_RGB: dict[str, tuple[int, int, int]] = {
+    'haiku':  TIER_RGB[1],
+    'sonnet': TIER_RGB[2],
+    'opus':   TIER_RGB[3],
+    'fable':  TIER_RGB[3],
+}
+
+# Сопоставление сырого уровня effort из stdin с цветом фона бейджа.
+EFFORT_RGB: dict[str, tuple[int, int, int]] = {
+    'low':    TIER_RGB[0],
+    'medium': TIER_RGB[1],
+    'high':   TIER_RGB[2],
+    'xhigh':  TIER_RGB[3],
+    'max':    TIER_RGB[3],
+}
+
+# Символ маркера «значение отличается от глобального дефолта». Рисуется в обеих
+# паддинг-ячейках бейджа (слева и справа от текста) — ширина бейджа не меняется.
+MARKER_CHAR = '!'
+
+# Доля белого в цвете маркера. Маркер рисуется «полупрозрачным белым» — смесью
+# белого с фоном бейджа: 1.0 — чисто белый, 0.0 — сливается с фоном.
+MARKER_WHITE_ALPHA = 0.65
+
+# Цвет текстового алерта '!DEF' после бейджей — тот же красный, что у фона
+# бейджей верхнего tier (Opus/Fable, xH).
+RGB_ALERT = TIER_RGB[3]
 
 # Сопоставление префикса имени API-поля с (краткое обозначение периода, длительность в секундах).
 # Имя поля разбирается как <prefix>_<suffix>: префикс задаёт период, суффикс — название категории.
@@ -113,6 +175,41 @@ PERIOD_PREFIXES: dict[str, tuple[str, int]] = {
     'five_hour': ('5h', FIVE_HOUR_SECONDS),
     'seven_day': ('7d', SEVEN_DAY_SECONDS),
 }
+
+
+def bg_escape(rgb: tuple[int, int, int]) -> str:
+    """ANSI-код true-color фона."""
+    return f'\033[48;2;{rgb[0]};{rgb[1]};{rgb[2]}m'
+
+
+def fg_escape(rgb: tuple[int, int, int]) -> str:
+    """ANSI-код true-color цвета текста."""
+    return f'\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m'
+
+
+def render_badge(text: str, bg_rgb: tuple[int, int, int], marked: bool) -> tuple[str, str]:
+    """
+    Собирает цветной бейдж с паддингами: ' text ', а при marked — '!text!':
+    маркеры занимают существующие паддинг-ячейки, ширина бейджа не меняется.
+
+    Терминал не поддерживает альфа-канал, поэтому «полупрозрачный белый» для
+    маркера предвычисляется как смесь белого (доля MARKER_WHITE_ALPHA) с цветом
+    фона бейджа — цвет маркера автоматически согласуется с любым фоном.
+
+    Возвращает (rendered, plain): вариант с ANSI-кодами и plain-вариант той же
+    видимой ширины для расчёта раскладки.
+
+    - text:   текст бейджа (без ANSI-кодов)
+    - bg_rgb: цвет фона бейджа
+    - marked: True — значение отличается от глобального дефолта
+    """
+    bg = bg_escape(bg_rgb)
+    if marked:
+        marker_fg = fg_escape(tuple(round(c + (255 - c) * MARKER_WHITE_ALPHA) for c in bg_rgb))
+        rendered = f'{bg}{marker_fg}{MARKER_CHAR}{FG_LABEL}{text}{marker_fg}{MARKER_CHAR}{FG_RESET}'
+    else:
+        rendered = f'{bg}{FG_LABEL} {text} {FG_RESET}'
+    return rendered, f' {text} '
 
 
 def parse_field(field: str) -> tuple[str, int] | None:
@@ -350,6 +447,111 @@ def release_lock(fd: int | None, lock_path: Path) -> None:
         pass
 
 
+# Алиасы поля model из settings.json, которые невозможно надёжно сопоставить
+# с конкретным model.id: их разрешение зависит от типа аккаунта и версии
+# Claude Code. Для них маркер отличия от дефолта не показываем.
+UNRESOLVABLE_MODEL_ALIASES: frozenset[str] = frozenset({'default', 'best', 'opusplan'})
+
+
+def load_global_defaults(settings_path: Path) -> tuple[str | None, str | None]:
+    """
+    Читает глобальные дефолты из ~/.claude/settings.json: поля model и
+    effortLevel — именно туда /model и /effort сохраняют «дефолт для новых
+    сессий».
+
+    Возвращает (model, effort_level); каждый элемент None, если поле
+    отсутствует, имеет не-строковый тип или файл нечитаем.
+
+    - settings_path: путь к settings.json
+    """
+    try:
+        settings = json.loads(settings_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return None, None
+    model = settings.get('model')
+    effort = settings.get('effortLevel')
+    return (model if isinstance(model, str) else None,
+            effort if isinstance(effort, str) else None)
+
+
+def split_model_window(saved_model: str) -> tuple[str, int | None]:
+    """
+    Разбирает значение поля model из settings.json на базовое имя (в нижнем
+    регистре) и размер контекстного окна из суффикса '[<N>m]' / '[<N>k]':
+    'claude-fable-5[1m]' → ('claude-fable-5', 1_000_000).
+
+    Размер не хардкодится под конкретные окна: '[2m]' даст 2_000_000, и
+    проверки продолжат работать при росте окон. Возвращает размер None, если
+    суффикса нет или он нераспознан (неизвестная единица, не-число).
+
+    - saved_model: значение поля model (ID или алиас, возможно с суффиксом окна)
+    """
+    value = saved_model.lower()
+    if not value.endswith(']') or '[' not in value:
+        return value, None
+    base, _, suffix = value[:-1].rpartition('[')
+    multipliers = {'m': 1_000_000, 'k': 1_000}
+    unit = suffix[-1:]
+    if unit in multipliers:
+        try:
+            return base, round(float(suffix[:-1]) * multipliers[unit])
+        except ValueError:
+            pass
+    return base, None
+
+
+def model_matches_default(model_id: str, saved_model: str) -> bool | None:
+    """
+    Проверяет, соответствует ли текущая модель сохранённому глобальному дефолту.
+
+    Сохранённое значение нормализуется через split_model_window (суффикс окна
+    отрезается, регистр нижний) и ищется как подстрока в model.id: это покрывает
+    и полные ID ('claude-fable-5[1m]' → 'claude-fable-5'), и алиасы ('fable'
+    содержится в 'claude-fable-5', 'opus' — в 'claude-opus-4-8').
+
+    Возвращает None, если сопоставление невозможно (алиас из
+    UNRESOLVABLE_MODEL_ALIASES) — в этом случае вывод о различии не делается.
+
+    - model_id:    идентификатор текущей модели из stdin (например, 'claude-fable-5')
+    - saved_model: значение поля model из settings.json (ID, ID с '[1m]' или алиас)
+    """
+    base, _ = split_model_window(saved_model)
+    if base in UNRESOLVABLE_MODEL_ALIASES:
+        return None
+    return base in model_id.lower()
+
+
+def detect_model_tier(model_name: str) -> str | None:
+    """
+    Возвращает ключ категории модели ('haiku' / 'sonnet' / 'opus' / 'fable')
+    по подстроке в имени модели, либо None для неизвестных. Сопоставление
+    регистронезависимое.
+
+    - model_name: имя модели для разбора (например, 'Opus 4.7')
+    """
+    name_lower = model_name.lower()
+    for tier in MODEL_TIER_RGB:
+        if tier in name_lower:
+            return tier
+    return None
+
+
+def format_context_size(size: int) -> str:
+    """
+    Форматирует размер контекстного окна компактно: 1_000_000 → '1m',
+    200_000 → '200k', 500_000 → '500k'. Используется в префиксе статуса
+    рядом с именем модели, чтобы показать реальный размер окна числом,
+    а не парсить его из текстового `display_name`.
+
+    - size: размер окна в токенах
+    """
+    if size >= 1_000_000:
+        return f'{size / 1_000_000:g}m'
+    if size >= 1_000:
+        return f'{size / 1_000:g}k'
+    return str(size)
+
+
 def format_remaining(seconds: float) -> str:
     """
     Компактное представление оставшегося времени единым старшим разрядом:
@@ -563,6 +765,62 @@ def main() -> None:
         else:
             ctx_window_size = cache.get('ctx_window_size')
 
+        # Имя модели для префикса. Из `model.display_name` отрезаем хвост в скобках
+        # (например, "Opus 4.7 (1M context)" → "Opus 4.7"): размер окна мы знаем
+        # отдельно как число и не зависим от текстового представления.
+        model_node = stdin_data.get('model')
+        if isinstance(model_node, dict):
+            raw_name = model_node.get('display_name')
+            if isinstance(raw_name, str) and raw_name:
+                parenthesis_idx = raw_name.find(' (')
+                model_name: str | None = raw_name[:parenthesis_idx] if parenthesis_idx > 0 else raw_name
+                if cache.get('claude_model_name') != model_name:
+                    cache['claude_model_name'] = model_name
+                    cache_updated = True
+            else:
+                model_name = cache.get('claude_model_name')
+        else:
+            model_name = cache.get('claude_model_name')
+
+        # Идентификатор модели (model.id) — для сравнения с глобальным дефолтом
+        # из settings.json. Кешируется по той же схеме, что display_name.
+        model_id: str | None = None
+        if isinstance(model_node, dict):
+            raw_id = model_node.get('id')
+            if isinstance(raw_id, str) and raw_id:
+                model_id = raw_id
+                if cache.get('claude_model_id') != model_id:
+                    cache['claude_model_id'] = model_id
+                    cache_updated = True
+        if model_id is None:
+            model_id = cache.get('claude_model_id')
+
+        # Флаг fast mode (`/fast`, ускоренный вывод Opus): верхнеуровневый буль
+        # `fast_mode` в stdin. Кешируем, чтобы при пустом stdin показать
+        # последнее известное состояние.
+        fast_mode = stdin_data.get('fast_mode')
+        if isinstance(fast_mode, bool):
+            if cache.get('claude_fast_mode') != fast_mode:
+                cache['claude_fast_mode'] = fast_mode
+                cache_updated = True
+        else:
+            fast_mode = bool(cache.get('claude_fast_mode'))
+
+        # Уровень thinking-effort из stdin: `effort.level` = 'low'|'medium'|'high'|'xhigh'.
+        # Кешируем сырое значение, чтобы при пустом stdin показать последнее известное.
+        effort_node = stdin_data.get('effort')
+        if isinstance(effort_node, dict):
+            level_raw = (effort_node.get('level') or '').lower()
+            if level_raw:
+                if cache.get('claude_effort') != level_raw:
+                    cache['claude_effort'] = level_raw
+                    cache_updated = True
+            else:
+                level_raw = cache.get('claude_effort') or ''
+        else:
+            level_raw = cache.get('claude_effort') or ''
+        effort_label = EFFORT_LABELS.get(level_raw)
+
         # five_hour и seven_day: stdin обновляет кеш и перекрывает данные из API
         rate_limits = stdin_data.get('rate_limits') or {}
         for field in STDIN_BAR_FIELDS:
@@ -608,22 +866,97 @@ def main() -> None:
     finally:
         release_lock(lock_fd, lock_path)
 
+    # Маркер отличия от глобального дефолта: текущие модель и effort сравниваются
+    # с полями model / effortLevel из ~/.claude/settings.json. Типичный случай —
+    # возобновлённая сессия, оставшаяся на старой модели после смены дефолта
+    # (resume сохраняет модель транскрипта и игнорирует настройки). При отличии
+    # к тексту бейджа дописывается '*'. Если дефолт не задан или алиас
+    # неразрешим — маркер не показывается.
+    default_model, default_effort = load_global_defaults(home / '.claude/settings.json')
+    model_differs = bool(
+        model_id and default_model
+        and model_matches_default(model_id, default_model) is False
+    )
+    effort_differs = bool(level_raw and default_effort) and level_raw != default_effort
+
+    # Контекстное окно меньше дефолтного: сохранённый дефолт явно задаёт размер
+    # суффиксом ('[1m]' и т.п.), а сессия работает с меньшим окном — типично для
+    # возобновлённой сессии, сохранившей вариант модели без расширенного окна.
+    # Обратное направление не проверяем: на Max-планах Opus апгрейдится до
+    # расширенного окна автоматически без суффикса в настройках, это штатно.
+    default_window = split_model_window(default_model)[1] if default_model else None
+    ctx_differs = bool(default_window and ctx_window_size and ctx_window_size < default_window)
+
+    # Суффикс справа от баров: "!Opus 4.7 ⚡! [1m] !xH! !DEF" — имя модели
+    # (с молнией, если включён fast mode), размер контекстного окна числом и
+    # короткий ярлык effort; маркеры '!' в паддинг-ячейках бейджа — значение
+    # отличается от глобального дефолта, при хотя бы одном отличии в конце
+    # дописывается красный '!DEF'. Любой компонент может отсутствовать.
+    # Имя модели и effort окрашиваются фоном по категории
+    # (Haiku/Sonnet/Opus/Fable, L/M/H/xH); бейдж размера окна — нейтральный серый.
+    # Параллельно копим plain-варианты сегментов: они нужны для расчёта
+    # видимой ширины (ANSI-коды в len() не годятся).
+    model_info_rendered_parts: list[str] = []
+    model_info_plain_parts:    list[str] = []
+
+    # Бейджи модели и effort рендерятся с внутренними пробелами-паддингами
+    # (' text '), чтобы цветной фон не прилипал к краю текста. Неизвестная
+    # модель/уровень тоже получает бейдж — нейтральный серый.
+    if model_name:
+        tier = detect_model_tier(model_name)
+        rgb = MODEL_TIER_RGB[tier] if tier else RGB_UNKNOWN
+        rendered, plain = render_badge(f'{model_name} ⚡' if fast_mode else model_name,
+                                       rgb, model_differs)
+        model_info_rendered_parts.append(rendered)
+        # ⚡ (U+26A1) — широкий символ: терминал рисует его в 2 ячейки, а len()
+        # считает за 1. Добавляем пробел в plain-вариант, чтобы расчёт видимой
+        # ширины совпадал с фактической.
+        model_info_plain_parts.append((plain + ' ') if fast_mode else plain)
+
+    if ctx_window_size:
+        # Размер контекстного окна — такой же бейдж, что у модели/effort,
+        # но нейтральный (серый фон, белый текст): это не категория, просто число.
+        rendered, plain = render_badge(format_context_size(ctx_window_size),
+                                       RGB_UNKNOWN, ctx_differs)
+        model_info_rendered_parts.append(rendered)
+        model_info_plain_parts.append(plain)
+
+    if effort_label:
+        rendered, plain = render_badge(effort_label,
+                                       EFFORT_RGB.get(level_raw, RGB_UNKNOWN),
+                                       effort_differs)
+        model_info_rendered_parts.append(rendered)
+        model_info_plain_parts.append(plain)
+
+    # Текстовый алерт «сессия отличается от глобального дефолта»: красный '!DEF'
+    # через пробел после бейджей, если отличается хотя бы один из трёх
+    # параметров. Дублирует маркеры в паддингах бейджей укрупнённым сигналом.
+    if model_differs or ctx_differs or effort_differs:
+        model_info_rendered_parts.append(f' {fg_escape(RGB_ALERT)}!DEF{FG_RESET}')
+        model_info_plain_parts.append(' !DEF')
+
+    # Сегменты склеиваются без пробелов-разделителей: у каждого бейджа уже
+    # есть свои внутренние паддинги, сплошной ряд смотрится как единый блок.
+    model_info_text        = ''.join(model_info_rendered_parts)
+    model_info_visible_len = sum(len(p) for p in model_info_plain_parts)
+
     # Адаптивная ширина.
-    # Итоговая строка: ctx_bar + N_bars×bar + N_bars×separator(1)
-    # → bar_width = (terminal_width - ctx_bar_width - N) / N
+    # Итоговая строка: ctx_bar + N_bars×bar + suffix + (separators по одному)
+    # → bar_width = (terminal_width - ctx_bar_width - suffix - N) / N
     # ctx_bar_width зависит от размера контекстного окна модели: один символ
     # покрывает CTX_TOKENS_PER_CHAR токенов, поэтому 150k токенов всегда
     # выглядят одной и той же шириной независимо от окна. ceil-деление через
     # (-(-a // b)) — без импорта math.
-    terminal_width = _get_terminal_width()
-    n              = max(1, len(bars))
+    terminal_width    = _get_terminal_width()
+    n                 = max(1, len(bars))
+    model_info_width  = model_info_visible_len + (1 if model_info_visible_len > 0 else 0)
     if ctx_window_size:
         ctx_bar_width = max(CTX_BAR_MIN_WIDTH, -(-ctx_window_size // CTX_TOKENS_PER_CHAR))
     else:
         ctx_bar_width = CTX_BAR_MIN_WIDTH
-    remaining      = terminal_width - ctx_bar_width - n * 1
-    bar_width      = max(8, remaining // n)
-    last_bar_extra = remaining - bar_width * n
+    remaining         = terminal_width - ctx_bar_width - model_info_width - n * 1
+    bar_width         = max(8, remaining // n)
+    last_bar_extra    = remaining - bar_width * n
 
     # Масштабируем ctx_pct относительно реально доступного окна (за вычетом буфера).
     # В кеше остаётся сырое значение; корректировка только для рендера.
@@ -677,6 +1010,9 @@ def main() -> None:
     for idx, (label, token_pct, time_pct) in enumerate(bars):
         width = bar_width + (last_bar_extra if idx == len(bars) - 1 else 0)
         parts.append(make_bar(token_pct, time_pct, width, label))
+
+    if model_info_text:
+        parts.append(model_info_text)
 
     print(' '.join(parts))
 
