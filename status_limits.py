@@ -13,6 +13,7 @@
 Ctx — бар без подписи (восьмушки для плавного края).
 Rate-limit бары — название рендерится текстом поверх цветного фона бара.
 Ширина баров адаптируется под ширину терминала.
+Имя папки проекта — белый хвост строки за пределами этой ширины.
 """
 
 import hashlib
@@ -92,7 +93,7 @@ EFFORT_LABELS: dict[str, str] = {
 
 # ANSI-цвета
 FG_RESET = '\033[0m'
-FG_LABEL = '\033[38;2;255;255;255m'   # белый текст поверх фона баров
+FG_LABEL = '\033[38;2;255;255;255m'   # белый: подписи поверх фона баров и имя папки
 
 # Фоновые цвета для четырёх состояний rate-limit баров
 BG_BOTH       = '\033[48;2;0;140;45m'      # токены + время (яркий зелёный)
@@ -548,6 +549,50 @@ def detect_model_tier(model_name: str) -> str | None:
     return None
 
 
+def folder_label(stdin_data: dict) -> str | None:
+    """
+    Возвращает имя папки проекта — хвостовой сегмент статуса.
+
+    Длина сознательно не ограничивается: сегмент рендерится за пределами
+    бюджета ширины, отданного барам, поэтому лишнее обрезает сам Claude Code
+    по фактической ширине терминала. Так бары не платят за длинное имя,
+    а короткое видно целиком.
+
+    Источник — `workspace.project_dir`, директория запуска Claude Code: имя
+    остаётся стабильным на всю жизнь окна, даже если рабочая директория сессии
+    ушла в подпапку. Фоллбэки по убыванию надёжности: `workspace.current_dir`,
+    затем cwd процесса — statusLine запускается из директории проекта.
+
+    Значение сознательно не кешируется, в отличие от модели и контекста: кеш
+    общий для всех окон Claude Code, и имя чужого проекта в свежем чате
+    дезинформировало бы ровно тогда, когда сегмент нужен больше всего —
+    при поиске глазами нужного окна.
+
+    Возвращает None, если имя определить не удалось.
+
+    - stdin_data: разобранный JSON из stdin
+    """
+    workspace = stdin_data.get('workspace')
+    sources = (
+        [workspace.get('project_dir'), workspace.get('current_dir')]
+        if isinstance(workspace, dict) else []
+    )
+
+    name = ''
+    for source in sources:
+        if isinstance(source, str) and source:
+            name = Path(source).name
+            if name:
+                break
+
+    if not name:
+        try:
+            name = Path.cwd().name
+        except OSError:
+            return None
+    return name or None
+
+
 def format_context_size(size: int) -> str:
     """
     Форматирует размер контекстного окна компактно: 1_000_000 → '1m',
@@ -755,8 +800,13 @@ def _get_terminal_width() -> int:
 
 
 def main() -> None:
+    # stdin читается байтами с явным UTF-8: Claude Code сериализует JSON через
+    # JSON.stringify и отдаёт сырой UTF-8, а текстовый sys.stdin на Windows
+    # берёт системную кодировку (например, cp1251) — кириллица в путях
+    # превращалась в мохибейк вида 'РђСЂС….РђР»СЊР±РѕРј'. errors='replace',
+    # чтобы одиночный битый байт не обнулял весь stdin вместе с барами.
     try:
-        stdin_data = json.loads(sys.stdin.read())
+        stdin_data = json.loads(sys.stdin.buffer.read().decode('utf-8', errors='replace'))
     except (json.JSONDecodeError, ValueError):
         stdin_data = {}
 
@@ -994,6 +1044,8 @@ def main() -> None:
     # Адаптивная ширина.
     # Итоговая строка: ctx_bar + N_bars×bar + suffix + (separators по одному)
     # → bar_width = (terminal_width - ctx_bar_width - suffix - N) / N
+    # Имя папки в расчёте не участвует: оно дописывается хвостом за пределами
+    # terminal_width (см. ниже), поэтому не отбирает ширину у баров.
     # ctx_bar_width зависит от размера контекстного окна модели: один символ
     # покрывает CTX_TOKENS_PER_CHAR токенов, поэтому 150k токенов всегда
     # выглядят одной и той же шириной независимо от окна. ceil-деление через
@@ -1064,6 +1116,15 @@ def main() -> None:
 
     if model_info_text:
         parts.append(model_info_text)
+
+    # Имя папки проекта — последним, уже за границей terminal_width. Ширину
+    # не резервируем и длину не ограничиваем: хвост обрежет сам Claude Code
+    # по фактической ширине терминала, зато бары всегда получают полный бюджет.
+    # Ведущий пробел даёт двойной отступ от бейджей (второй добавит join):
+    # имя без фона иначе читается как продолжение последнего бейджа.
+    folder_name = folder_label(stdin_data)
+    if folder_name:
+        parts.append(f' {FG_LABEL}{folder_name}{FG_RESET}')
 
     print(' '.join(parts))
 
