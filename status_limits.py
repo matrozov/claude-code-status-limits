@@ -39,6 +39,13 @@ FIVE_HOUR_SECONDS = 5 * 3600
 SEVEN_DAY_SECONDS = 7 * 24 * 3600
 API_CACHE_TTL     = 300  # секунд
 
+# TTL после неудачной попытки — короче обычного. Сбои usage API обычно
+# транзиентные (типичный случай — Windows не смог проверить отзыв сертификата
+# и оборвал TLS), и держать алерт '!API' с пропавшими API-барами все
+# API_CACHE_TTL секунд не за что. Сильно уменьшать тоже не стоит: неудачная
+# попытка тратит до --max-time секунд прямо в рендере статус-бара.
+API_ERROR_CACHE_TTL = 60  # секунд
+
 # Параметры межпроцессного лока на кеш-файл. Лок берётся через O_CREAT|O_EXCL
 # — единственный кроссплатформенный без зависимостей способ. LOCK_TIMEOUT
 # страхует от мёртвых локов (процесс упал, не освободив): если файл-лок
@@ -679,8 +686,9 @@ def _token_fingerprint(credentials_path: Path) -> str | None:
 
 def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, claude_version: str) -> bool:
     """
-    Обновляет cached_bars из OAuth usage API если истёк TTL (API_CACHE_TTL секунд)
-    или если OAuth-токен изменился с момента последнего запроса.
+    Обновляет cached_bars из OAuth usage API если истёк TTL или если OAuth-токен
+    изменился с момента последнего запроса. TTL зависит от исхода прошлой попытки:
+    API_CACHE_TTL после успеха, укороченный API_ERROR_CACHE_TTL после ошибки.
 
     Разбирает два формата ответа: плоские поля верхнего уровня со словарём
     {utilization, resets_at} (старый формат) и массив limits со scoped-записями
@@ -708,7 +716,9 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, cl
         # Токен изменился — сбрасываем TTL для немедленного обновления
         cache['_api_cached_at'] = 0
 
-    if time_module.time() - cache.get('_api_cached_at', 0) < API_CACHE_TTL:
+    # После ошибки повторяем раньше, чем после успеха.
+    ttl = API_ERROR_CACHE_TTL if cache.get('_api_error') else API_CACHE_TTL
+    if time_module.time() - cache.get('_api_cached_at', 0) < ttl:
         return False
 
     # Очищаем API-бары до запроса: на ошибке останутся пустыми, на успехе — перезаполнятся
