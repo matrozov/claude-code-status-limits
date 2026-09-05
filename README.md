@@ -52,7 +52,7 @@ A row of badges after the bars describes the session itself:
 
 - **Model** — the display name, with a ⚡ when fast mode is on.
 - **Context window** — its size as a number, `200k` or `1m`.
-- **Effort** — a short label for the thinking effort level: `L`, `M`, `H`, `xH`.
+- **Effort** — a short label for the thinking effort level: `L`, `M`, `H`, `xH` and `Mx`, for low, medium, high, xhigh and max.
 
 Model and effort share one four-step color scale — slate, green, amber, red — so the same level of intensity looks the same on both. The window size badge stays neutral: it is a number, not a category.
 

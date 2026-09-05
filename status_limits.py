@@ -89,13 +89,14 @@ STDIN_BAR_FIELDS: tuple[str, ...] = ('five_hour', 'seven_day')
 
 # Короткие ярлыки для уровня thinking-effort из stdin (поле effort.level).
 # Отсутствующий в словаре уровень не показывается — лучше не врать, чем показывать
-# угадку, если Anthropic добавит новый уровень.
+# угадку, если Anthropic добавит новый уровень. Ярлыки обязаны отличаться друг
+# от друга: 'max' взят двухсимвольным, иначе он совпал бы с 'medium'.
 EFFORT_LABELS: dict[str, str] = {
     'low':    'L',
     'medium': 'M',
     'high':   'H',
     'xhigh':  'xH',
-    'max':    'M',
+    'max':    'Mx',
 }
 
 # ANSI-цвета
@@ -909,7 +910,7 @@ def main() -> None:
         else:
             fast_mode = bool(cache.get('claude_fast_mode'))
 
-        # Уровень thinking-effort из stdin: `effort.level` = 'low'|'medium'|'high'|'xhigh'.
+        # Уровень thinking-effort из stdin: `effort.level` = 'low'|'medium'|'high'|'xhigh'|'max'.
         # Кешируем сырое значение, чтобы при пустом stdin показать последнее известное.
         effort_node = stdin_data.get('effort')
         if isinstance(effort_node, dict):
