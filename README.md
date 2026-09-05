@@ -12,7 +12,19 @@ A status bar script for [Claude Code](https://claude.ai/code) that visualizes co
 
 Shows how full the current conversation context window is. Claude Code reserves a fixed 33k-token autocompact buffer and automatically compresses the conversation history when that threshold is reached. The buffer percentage depends on the context window size: ~16.5% for 200k, ~3.3% for 1M.
 
-The bar scales to the usable portion of the window, so it reaches 100% exactly when autocompact is about to trigger. If the context has already entered the buffer zone, the bar turns **amber**.
+The bar scales to the usable portion of the window, so it reaches 100% exactly when autocompact is about to trigger.
+
+Its width follows the window size — one character per 50k tokens, never fewer than six. A 1M window gets 20 characters, 500k gets 10, and anything up to 300k gets the six-character minimum. The point is that a given number of tokens always occupies the same width, whatever model you are on.
+
+The fill color escalates in three steps:
+
+**Gray** — normal.
+
+**Amber** — the context passed 150k tokens, the boundary Claude Code itself singles out when it reports usage, or it has entered the autocompact buffer.
+
+**Red** — the context passed 300k tokens. On a large window autocompact fires so late that the context can grow well past a reasonable size unnoticed.
+
+The empty part of the bar is tinted by zone — neutral below 150k, faintly warm between 150k and 300k, faintly red above — so the distance to the next threshold is readable before it is crossed.
 
 ### Rate limit bars
 
@@ -30,17 +42,41 @@ Every rate limit bar encodes two things at once: how much of the quota has been 
 
 **Dark gray** — no data yet, or the window just opened.
 
+#### Time left
+
+An amber bar tells you that you are burning through a quota, but not how long that has to last. Its label therefore carries the time remaining until the window resets: `7d (2d left)`. It is written as a single leading unit — `45m`, `2h`, `3d` — so it fits even a narrow segment.
+
+### Session badges
+
+A row of badges after the bars describes the session itself:
+
+- **Model** — the display name, with a ⚡ when fast mode is on.
+- **Context window** — its size as a number, `200k` or `1m`.
+- **Effort** — a short label for the thinking effort level: `L`, `M`, `H`, `xH`.
+
+Model and effort share one four-step color scale — slate, green, amber, red — so the same level of intensity looks the same on both. The window size badge stays neutral: it is a number, not a category.
+
+Each of the three is also compared against the global defaults in `~/.claude/settings.json`. If one differs, its badge is marked in the padding cells and a red **!DEF** follows the row. The usual cause is a resumed session: it keeps the model recorded in its transcript and ignores a later change of default.
+
+A red **!API** means the last usage API refresh failed and the per-model bars are missing. Without it a broken sync is indistinguishable from simply having no extra quotas.
+
+### Project folder
+
+The project directory name is appended at the very end, so several open windows can be told apart at a glance. It is taken from the directory Claude Code was started in, which keeps it stable for the life of the window even when the session moves into a subdirectory.
+
 ## Data sources
 
 The script receives data from two independent sources.
 
 **Claude Code itself** passes context window fill and the 5h/7d rate limit state after each turn. These values are only available once the conversation has started, so the very first render of a new chat relies on cached data from the previous session.
 
-**The Claude.ai usage API** provides per-model quotas such as Sonnet 7d, Opus 7d, and others. It is queried using the OAuth token that Claude Code itself uses to authenticate, so no separate credentials are needed. The API is refreshed at most once every 5 minutes.
+**The Claude.ai usage API** provides per-model quotas such as Sonnet 7d and Opus 7d, including limits scoped to a single model — the weekly Fable one, for example. It is queried using the OAuth token that Claude Code itself uses to authenticate, so no separate credentials are needed. The API is refreshed at most once every 5 minutes, or once a minute after a failed attempt, since those failures are usually transient.
 
 ## Caching
 
 The last known state of every bar is saved to `~/.claude/status_limits_cache.json`. This means bars always show something meaningful even at the start of a fresh chat, before any turn data has come in. As new data arrives — from Claude Code or from the API — the cache is updated, and the two sources are merged: when they overlap, the live Claude Code data takes priority over the API.
+
+Every open Claude Code window shares this one file, so the script takes a lock around each read-modify-write cycle and replaces the file atomically.
 
 ## Setup
 
@@ -57,10 +93,12 @@ Adjust the path to wherever you cloned the repository. Python 3.10+ and `curl` a
 
 ### Bar width
 
-Claude Code places other content (such as a token counter) to the right of the status bar output, so the bars never occupy the full terminal width. By default the script renders at 120 columns. To control how wide the bar strip is, pass the desired width as an argument:
+Claude Code places other content (such as a token counter) to the right of the status bar output, so the bars never occupy the full terminal width. By default the script renders at 120 columns. To control how wide the strip is, pass the desired width as an argument:
 
 ```json
 "command": "python /path/to/claude-code-status-limits/status_limits.py 100"
 ```
 
 Adjust the value until the bars fit the available space in your terminal.
+
+The width covers the bars and the badge row. The folder name is deliberately left out of it and written past the edge, where Claude Code trims it at the real terminal width — so a long project name never takes space away from the bars.
