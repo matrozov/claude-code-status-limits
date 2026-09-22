@@ -474,23 +474,38 @@ def release_lock(fd: int | None, lock_path: Path) -> None:
 UNRESOLVABLE_MODEL_ALIASES: frozenset[str] = frozenset({'default', 'best', 'opusplan'})
 
 
-def load_global_defaults(settings_path: Path) -> tuple[str | None, str | None]:
+def load_global_defaults(settings_path: Path, model_id: str | None) -> tuple[str | None, str | None]:
     """
-    Читает глобальные дефолты из ~/.claude/settings.json: поля model и
-    effortLevel — именно туда /model и /effort сохраняют «дефолт для новых
-    сессий».
+    Читает глобальные дефолты из ~/.claude/settings.json — туда /model и
+    /effort сохраняют «дефолт для новых сессий».
 
-    Возвращает (model, effort_level); каждый элемент None, если поле
+    Модель берётся из поля model. Effort Claude Code хранит отдельно для каждой
+    модели: /effort пишет в modelSettings.<модель>.effortLevel, где <модель> —
+    model.id без суффикса окна ('claude-opus-5-5[1m]' → 'claude-opus-5-5').
+    Верхнеуровневый effortLevel остался от прежнего формата настроек и служит
+    запасным значением, если записи для текущей модели нет.
+
+    Возвращает (model, effort_level); каждый элемент None, если значение
     отсутствует, имеет не-строковый тип или файл нечитаем.
 
     - settings_path: путь к settings.json
+    - model_id:      идентификатор текущей модели из stdin (или None)
     """
     try:
         settings = json.loads(settings_path.read_text(encoding='utf-8'))
     except (OSError, json.JSONDecodeError):
         return None, None
     model = settings.get('model')
-    effort = settings.get('effortLevel')
+
+    effort = None
+    model_settings = settings.get('modelSettings')
+    if model_id and isinstance(model_settings, dict):
+        per_model = model_settings.get(split_model_window(model_id)[0])
+        if isinstance(per_model, dict):
+            effort = per_model.get('effortLevel')
+    if not isinstance(effort, str):
+        effort = settings.get('effortLevel')
+
     return (model if isinstance(model, str) else None,
             effort if isinstance(effort, str) else None)
 
@@ -971,12 +986,12 @@ def main() -> None:
         release_lock(lock_fd, lock_path)
 
     # Маркер отличия от глобального дефолта: текущие модель и effort сравниваются
-    # с полями model / effortLevel из ~/.claude/settings.json. Типичный случай —
-    # возобновлённая сессия, оставшаяся на старой модели после смены дефолта
-    # (resume сохраняет модель транскрипта и игнорирует настройки). При отличии
-    # к тексту бейджа дописывается '*'. Если дефолт не задан или алиас
-    # неразрешим — маркер не показывается.
-    default_model, default_effort = load_global_defaults(home / '.claude/settings.json')
+    # с дефолтами из ~/.claude/settings.json (effort — для текущей модели, см.
+    # load_global_defaults). Типичный случай — возобновлённая сессия, оставшаяся
+    # на старой модели после смены дефолта (resume сохраняет модель транскрипта
+    # и игнорирует настройки). При отличии бейдж получает маркеры '!' в
+    # паддингах. Если дефолт не задан или алиас неразрешим — маркер не показывается.
+    default_model, default_effort = load_global_defaults(home / '.claude/settings.json', model_id)
     model_differs = bool(
         model_id and default_model
         and model_matches_default(model_id, default_model) is False
