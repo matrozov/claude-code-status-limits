@@ -54,11 +54,15 @@ A row of badges after the bars describes the session itself:
 - **Context window** — its size as a number, `200k` or `1m`.
 - **Effort** — a short label for the thinking effort level: `L`, `M`, `H`, `xH` and `Mx`, for low, medium, high, xhigh and max.
 
-Model and effort share one four-step color scale — slate, green, amber, red — so the same level of intensity looks the same on both. The window size badge stays neutral: it is a number, not a category.
+Model and effort share one four-step color scale — slate, green, amber, red — so the same level of intensity looks the same on both. Green, amber, and red are the same shades as on the bars. The window size badge stays neutral, dark gray like the empty part of the bar: it is a number, not a category.
 
-Each of the three is also compared against the global defaults in `~/.claude/settings.json`. If one differs, its badge is marked in the padding cells and a red **!DEF** follows the row. The usual cause is a resumed session: it keeps the model recorded in its transcript and ignores a later change of default.
+Each of the three is also compared against the defaults. If one differs, its badge is marked in the padding cells and a red badge **DEF** follows the row. The usual cause is a resumed session: it keeps the model recorded in its transcript and ignores a later change of default.
 
-A red **!API** means the last usage API refresh failed and the per-model bars are missing. Without it a broken sync is indistinguishable from simply having no extra quotas.
+- **Model** is compared down to the version: Opus 4.5 with a default of Opus 5.5 counts as different. The reference is the `model` field in `~/.claude/settings.json`, then the `ANTHROPIC_DEFAULT_MODEL` environment variable. If the model is set to "Default" and the field is not saved, the reference comes from the Claude Code model catalog cache (`~/.claude/cache/model-catalog`). An alias like `opus` is resolved to the current family version from the same catalog. The catalog format is internal and may change; without it the model check is skipped.
+- **Context window** is checked only if the `model` field explicitly includes a size, like `claude-opus-5-5[1m]`.
+- **Effort** is compared against `modelSettings.<model>.effortLevel` — where `/effort` writes it — and if not set there, against the top-level `effortLevel`.
+
+A red badge **API** means the last usage API refresh failed and the per-model bars are missing. Without it a broken sync is indistinguishable from simply having no extra quotas.
 
 ### Project folder
 

@@ -20,6 +20,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import time as time_module
@@ -41,7 +42,7 @@ API_CACHE_TTL     = 300  # секунд
 
 # TTL после неудачной попытки — короче обычного. Сбои usage API обычно
 # транзиентные (типичный случай — Windows не смог проверить отзыв сертификата
-# и оборвал TLS), и держать алерт '!API' с пропавшими API-барами все
+# и оборвал TLS), и держать бейдж-алерт 'API' с пропавшими API-барами все
 # API_CACHE_TTL секунд не за что. Сильно уменьшать тоже не стоит: неудачная
 # попытка тратит до --max-time секунд прямо в рендере статус-бара.
 API_ERROR_CACHE_TTL = 60  # секунд
@@ -125,24 +126,29 @@ BG_EMPTY_DANGER = '\033[48;2;64;28;28m'     # пусто, зона >300k ток�
 
 # Единая 4-уровневая шкала фоновых цветов «slate → green → amber → red».
 # Применяется и к категориям моделей, и к уровням effort: Unknown ≡ L (slate),
-# Haiku ≡ M (green), Sonnet ≡ H (amber), Opus/Fable ≡ xH (red). Один и тот же
+# Haiku ≡ M (green), Sonnet ≡ H (amber), Opus/Fable ≡ xH/Mx (red). Один и тот же
 # уровень интенсивности на обеих осях окрашивается одинаково — взгляд сразу
-# видит «насколько мощно/энергично». Палитра отличается от rate-limit баров
-# (тёмно-серый пустого участка), чтобы блок «модель/контекст/effort»
-# визуально отделялся от баров.
+# видит «насколько мощно/энергично». Зелёный, янтарный и красный взяты из
+# палитры баров, чтобы в строке не было близких, но разных оттенков; slate
+# своего аналога в барах не имеет и отличается от их тёмно-серого пустого участка.
 # Хранится RGB-кортежами, а не готовыми ANSI-кодами: из цвета фона дополнительно
 # вычисляется цвет маркера отличия от дефолта (смесь белого с фоном,
 # доля белого — MARKER_WHITE_ALPHA).
 TIER_RGB: tuple[tuple[int, int, int], ...] = (
     (80, 90, 100),   # 0: slate
-    (40, 110, 70),   # 1: green
-    (190, 130, 0),   # 2: amber
+    (0, 140, 45),    # 1: green (тот же оттенок, что у BG_BOTH)
+    (190, 135, 0),   # 2: amber (тот же оттенок, что у BG_TOKEN_ONLY и FG_CTX_WARN)
     (150, 35, 35),   # 3: red (тот же оттенок, что у FG_CTX_DANGER)
 )
 
-# Фон для неизвестной модели и нейтральных бейджей (например, размера контекста).
+# Фон для неизвестной модели и неизвестного уровня effort.
 # Совпадает с уровнем 0 шкалы, чтобы Unknown визуально стыковался с L.
 RGB_UNKNOWN = TIER_RGB[0]
+
+# Фон бейджа размера контекстного окна — тот же тёмно-серый, что у пустого
+# участка баров (BG_EMPTY). Размер окна — число, а не ступень интенсивности,
+# поэтому он окрашен вне шкалы TIER_RGB.
+RGB_NEUTRAL = (55, 55, 55)
 
 # Сопоставление подстроки в имени модели с цветом фона бейджа.
 # Подстроки берутся в нижнем регистре; имя модели матчится через `.lower()`.
@@ -170,8 +176,8 @@ MARKER_CHAR = '!'
 # белого с фоном бейджа: 1.0 — чисто белый, 0.0 — сливается с фоном.
 MARKER_WHITE_ALPHA = 0.65
 
-# Цвет текстового алерта '!DEF' после бейджей — тот же красный, что у фона
-# бейджей верхнего tier (Opus/Fable, xH).
+# Фон бейджей-алертов 'DEF' и 'API' после бейджей сессии — тот же красный,
+# что у бейджей верхнего tier (Opus/Fable, xH/Mx).
 RGB_ALERT = TIER_RGB[3]
 
 # Сопоставление префикса имени API-поля с (краткое обозначение периода, длительность в секундах).
@@ -471,7 +477,79 @@ def release_lock(fd: int | None, lock_path: Path) -> None:
 # Алиасы поля model из settings.json, которые невозможно надёжно сопоставить
 # с конкретным model.id: их разрешение зависит от типа аккаунта и версии
 # Claude Code. Для них маркер отличия от дефолта не показываем.
-UNRESOLVABLE_MODEL_ALIASES: frozenset[str] = frozenset({'default', 'best', 'opusplan'})
+UNRESOLVABLE_MODEL_ALIASES: frozenset[str] = frozenset({'best', 'opusplan'})
+
+# Суффикс даты в полных ID моделей ('claude-haiku-4-5-20251001'). Отбрасывается
+# при сравнении: датированный и недатированный ID обозначают одну модель.
+MODEL_DATE_SUFFIX = re.compile(r'-\d{8}$')
+
+
+def load_model_catalog(catalog_dir: Path) -> dict | None:
+    """
+    Читает кеш серверного каталога моделей Claude Code — единственный локальный
+    источник модели, которую Claude Code считает дефолтной, когда в settings.json
+    поле model не задано (пункт «Default» в /model и /config удаляет ключ).
+
+    Формат внутренний и не документирован (файл <org>-<hash>-cc.json, version 2):
+    catalog.state.model — дефолтная модель аккаунта, state.org_enforced_default_model —
+    модель, навязанная организацией, catalog.config.models[] — список моделей с
+    разделами 'main' / 'overflow'. При нескольких файлах берётся самый свежий по
+    времени изменения: Claude Code перезаписывает кеш при каждом обновлении.
+
+    Возвращает объект catalog либо None, если кеша нет, он нечитаем или его
+    формат не распознан.
+
+    - catalog_dir: каталог кеша (~/.claude/cache/model-catalog)
+    """
+    try:
+        files = sorted(catalog_dir.glob('*-cc.json'), key=lambda path: path.stat().st_mtime)
+        catalog = json.loads(files[-1].read_text(encoding='utf-8')).get('catalog') if files else None
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    return catalog if isinstance(catalog, dict) else None
+
+
+def catalog_default_model(catalog: dict | None) -> str | None:
+    """
+    Возвращает дефолтную модель аккаунта из каталога: навязанная организацией
+    приоритетнее модели, выбранной сервером, — в том же порядке её выбирает
+    сам Claude Code.
+
+    - catalog: объект из load_model_catalog (или None)
+    """
+    state = catalog.get('state') if catalog else None
+    if not isinstance(state, dict):
+        return None
+    for key in ('org_enforced_default_model', 'model'):
+        value = state.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def resolve_model_alias(alias: str, catalog: dict | None) -> str | None:
+    """
+    Разрешает алиас семейства ('opus', 'sonnet', ...) в полный ID текущей
+    версии: первая модель семейства в основном разделе каталога ('main').
+    Каталог перечисляет актуальные модели первыми, поэтому 'opus' разрешается
+    в новейший Opus. Это эвристика: таблицы алиасов в каталоге нет.
+
+    Возвращает None, если каталога нет или модель семейства в нём не найдена.
+
+    - alias:   алиас в нижнем регистре без суффикса окна
+    - catalog: объект из load_model_catalog (или None)
+    """
+    config = catalog.get('config') if catalog else None
+    models = config.get('models') if isinstance(config, dict) else None
+    if not isinstance(models, list):
+        return None
+    for model in models:
+        if not isinstance(model, dict) or model.get('section') != 'main':
+            continue
+        model_id = model.get('id')
+        if isinstance(model_id, str) and model_id.lower().startswith(f'claude-{alias}-'):
+            return model_id
+    return None
 
 
 def load_global_defaults(settings_path: Path, model_id: str | None) -> tuple[str | None, str | None]:
@@ -536,25 +614,49 @@ def split_model_window(saved_model: str) -> tuple[str, int | None]:
     return base, None
 
 
-def model_matches_default(model_id: str, saved_model: str) -> bool | None:
+def normalize_model_id(model_id: str) -> str:
     """
-    Проверяет, соответствует ли текущая модель сохранённому глобальному дефолту.
+    Приводит ID модели к сравнимому виду: нижний регистр, без суффикса окна
+    и без суффикса даты ('claude-haiku-4-5-20251001[1m]' → 'claude-haiku-4-5').
 
-    Сохранённое значение нормализуется через split_model_window (суффикс окна
-    отрезается, регистр нижний) и ищется как подстрока в model.id: это покрывает
-    и полные ID ('claude-fable-5[1m]' → 'claude-fable-5'), и алиасы ('fable'
-    содержится в 'claude-fable-5', 'opus' — в 'claude-opus-4-8').
+    - model_id: полный ID модели
+    """
+    return MODEL_DATE_SUFFIX.sub('', split_model_window(model_id)[0])
+
+
+def model_matches_default(model_id: str, saved_model: str, catalog: dict | None) -> bool | None:
+    """
+    Проверяет, соответствует ли текущая модель дефолтной с точностью до версии:
+    Opus 4.5 при дефолте Opus 5.5 — несовпадение.
+
+    Полные ID сравниваются целиком после normalize_model_id: подстрочное
+    сравнение сочло бы 'claude-opus-5' совпадающим с 'claude-opus-5-5'.
+    Алиас 'default' разрешается в дефолтную модель каталога, алиас семейства
+    ('opus', 'fable', ...) — в текущую версию семейства по каталогу. Без
+    каталога алиас семейства сверяется только по семейству, без версии.
 
     Возвращает None, если сопоставление невозможно (алиас из
-    UNRESOLVABLE_MODEL_ALIASES) — в этом случае вывод о различии не делается.
+    UNRESOLVABLE_MODEL_ALIASES или 'default' без каталога) — в этом случае
+    вывод о различии не делается.
 
-    - model_id:    идентификатор текущей модели из stdin (например, 'claude-fable-5')
-    - saved_model: значение поля model из settings.json (ID, ID с '[1m]' или алиас)
+    - model_id:    идентификатор текущей модели из stdin (например, 'claude-fable-5[1m]')
+    - saved_model: дефолт (ID, ID с '[1m]' или алиас) из settings.json, окружения или каталога
+    - catalog:     объект из load_model_catalog (или None)
     """
     base, _ = split_model_window(saved_model)
     if base in UNRESOLVABLE_MODEL_ALIASES:
         return None
-    return base in model_id.lower()
+    if base == 'default':
+        resolved = catalog_default_model(catalog)
+        if resolved is None:
+            return None
+    elif base.startswith('claude-'):
+        resolved = base
+    else:
+        resolved = resolve_model_alias(base, catalog)
+        if resolved is None:
+            return base in model_id.lower()
+    return normalize_model_id(model_id) == normalize_model_id(resolved)
 
 
 def detect_model_tier(model_name: str) -> str | None:
@@ -716,7 +818,7 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, cl
     случаях, чтобы не повторять запрос при каждом ходу.
 
     Побочный эффект: пишет в cache флаг _api_error (True — последняя попытка
-    обновления провалилась), по которому рендер показывает алерт '!API'.
+    обновления провалилась), по которому рендер показывает бейдж-алерт 'API'.
 
     Возвращает True если кеш был изменён, False если TTL ещё не истёк.
 
@@ -991,10 +1093,16 @@ def main() -> None:
     # на старой модели после смены дефолта (resume сохраняет модель транскрипта
     # и игнорирует настройки). При отличии бейдж получает маркеры '!' в
     # паддингах. Если дефолт не задан или алиас неразрешим — маркер не показывается.
+    # Дефолтная модель ищется в том же порядке, что у Claude Code: явный выбор
+    # в settings.json, затем ANTHROPIC_DEFAULT_MODEL (окружение наследуется от
+    # Claude Code), затем кеш серверного каталога моделей.
     default_model, default_effort = load_global_defaults(home / '.claude/settings.json', model_id)
+    catalog = load_model_catalog(home / '.claude/cache/model-catalog')
+    default_model = (default_model or os.environ.get('ANTHROPIC_DEFAULT_MODEL')
+                     or catalog_default_model(catalog))
     model_differs = bool(
         model_id and default_model
-        and model_matches_default(model_id, default_model) is False
+        and model_matches_default(model_id, default_model, catalog) is False
     )
     effort_differs = bool(level_raw and default_effort) and level_raw != default_effort
 
@@ -1006,14 +1114,14 @@ def main() -> None:
     default_window = split_model_window(default_model)[1] if default_model else None
     ctx_differs = bool(default_window and ctx_window_size and ctx_window_size < default_window)
 
-    # Суффикс справа от баров: "!Opus 4.7 ⚡! [1m] !xH! !DEF !API" — имя модели
+    # Суффикс справа от баров: "!Opus 4.7 ⚡! 1m !xH!  DEF  API " — имя модели
     # (с молнией, если включён fast mode), размер контекстного окна числом и
     # короткий ярлык effort; маркеры '!' в паддинг-ячейках бейджа — значение
     # отличается от глобального дефолта, при хотя бы одном отличии в конце
-    # дописывается красный '!DEF'; красный '!API' — последняя попытка обновить
-    # usage API провалилась. Любой компонент может отсутствовать. Имя модели и
-    # effort окрашиваются фоном по категории (Haiku/Sonnet/Opus/Fable, L/M/H/xH);
-    # бейдж размера окна — нейтральный серый.
+    # добавляется красный бейдж 'DEF'; красный бейдж 'API' — последняя попытка
+    # обновить usage API провалилась. Любой компонент может отсутствовать. Имя модели и
+    # effort окрашиваются фоном по категории (Haiku/Sonnet/Opus/Fable, L/M/H/xH/Mx);
+    # бейдж размера окна — тёмно-серый фон баров.
     # Параллельно копим plain-варианты сегментов: они нужны для расчёта
     # видимой ширины (ANSI-коды в len() не годятся).
     model_info_rendered_parts: list[str] = []
@@ -1021,7 +1129,7 @@ def main() -> None:
 
     # Бейджи модели и effort рендерятся с внутренними пробелами-паддингами
     # (' text '), чтобы цветной фон не прилипал к краю текста. Неизвестная
-    # модель/уровень тоже получает бейдж — нейтральный серый.
+    # модель/уровень тоже получает бейдж — сланцевый, как нулевая ступень шкалы.
     if model_name:
         tier = detect_model_tier(model_name)
         rgb = MODEL_TIER_RGB[tier] if tier else RGB_UNKNOWN
@@ -1035,9 +1143,9 @@ def main() -> None:
 
     if ctx_window_size:
         # Размер контекстного окна — такой же бейдж, что у модели/effort,
-        # но нейтральный (серый фон, белый текст): это не категория, просто число.
+        # но нейтральный (тёмно-серый фон баров, белый текст): это не категория, просто число.
         rendered, plain = render_badge(format_context_size(ctx_window_size),
-                                       RGB_UNKNOWN, ctx_differs)
+                                       RGB_NEUTRAL, ctx_differs)
         model_info_rendered_parts.append(rendered)
         model_info_plain_parts.append(plain)
 
@@ -1048,19 +1156,25 @@ def main() -> None:
         model_info_rendered_parts.append(rendered)
         model_info_plain_parts.append(plain)
 
-    # Текстовый алерт «сессия отличается от глобального дефолта»: красный '!DEF'
-    # через пробел после бейджей, если отличается хотя бы один из трёх
-    # параметров. Дублирует маркеры в паддингах бейджей укрупнённым сигналом.
+    # Алерты — красные бейджи через пробел после бейджей сессии. Бейджем, а не
+    # красным текстом: тёмно-красный текст на тёмном фоне терминала почти не
+    # читается, белый текст на красном фоне заметен сразу.
+    # 'DEF' — сессия отличается от глобального дефолта хотя бы по одному из трёх
+    # параметров; дублирует маркеры в паддингах бейджей укрупнённым сигналом.
+    # 'API' — не удалось обновить данные usage API: без него ошибка синхронизации
+    # неотличима от «просто нет дополнительных баров», и пропажу API-лимитов
+    # легко долго не замечать.
+    alerts = []
     if model_differs or ctx_differs or effort_differs:
-        model_info_rendered_parts.append(f' {fg_escape(RGB_ALERT)}!DEF{FG_RESET}')
-        model_info_plain_parts.append(' !DEF')
-
-    # Текстовый алерт «не удалось обновить данные usage API»: красный '!API'.
-    # Без него ошибка синхронизации неотличима от «просто нет дополнительных
-    # баров», и пропажу API-лимитов легко долго не замечать.
+        alerts.append('DEF')
     if cache.get('_api_error'):
-        model_info_rendered_parts.append(f' {fg_escape(RGB_ALERT)}!API{FG_RESET}')
-        model_info_plain_parts.append(' !API')
+        alerts.append('API')
+    # Каждый алерт отделён пробелом: одноцветные бейджи вплотную слились бы в
+    # одну плашку 'DEF  API'.
+    for alert in alerts:
+        rendered, plain = render_badge(alert, RGB_ALERT, False)
+        model_info_rendered_parts.append(f' {rendered}')
+        model_info_plain_parts.append(f' {plain}')
 
     # Сегменты склеиваются без пробелов-разделителей: у каждого бейджа уже
     # есть свои внутренние паддинги, сплошной ряд смотрится как единый блок.
