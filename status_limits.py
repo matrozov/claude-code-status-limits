@@ -871,11 +871,13 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, cl
             if utilization is None:
                 continue
             resets_at_iso = value.get('resets_at')
-            # Категория объявлена в API, но окно для пользователя не открыто
-            # и использования нет: бар бесполезен, скрываем, чтобы не занимать
-            # ширину у значимых баров. Появится автоматически, как только
-            # будет фактическое потребление или сервер откроет окно.
-            if utilization == 0 and resets_at_iso is None:
+            # Дополнительная категория без расхода скрывается, чтобы не занимать
+            # ширину у значимых баров: при 0% бар показывал бы только ход
+            # времени, который и так виден на общем 7d. Наличие resets_at не
+            # учитывается — сервер отдаёт его и для нулевых лимитов, привязывая
+            # их к общему недельному окну. Бар появится при следующем опросе
+            # API после первого расхода. Базовые 5h/7d не скрываются никогда.
+            if utilization == 0 and field not in STDIN_BAR_FIELDS:
                 continue
             cached_bars[field] = {'token_pct': utilization, 'resets_at': iso_to_unix(resets_at_iso)}
         # Scoped-лимиты из массива limits (новый формат API): например, недельный
@@ -893,13 +895,12 @@ def maybe_refresh_api(credentials_path: Path, cache: dict, cached_bars: dict, cl
             display_name = model_scope.get('display_name') if isinstance(model_scope, dict) else None
             if not display_name:
                 continue
-            resets_at_iso = entry.get('resets_at')
-            # То же правило скрытия, что и у плоских полей: лимит объявлен,
-            # но окно не открыто и расхода нет.
-            if percent == 0 and resets_at_iso is None:
+            # То же правило скрытия, что и у плоских полей: лимит без расхода
+            # не показывается, даже если у него уже есть время сброса.
+            if percent == 0:
                 continue
             field = f'{prefix}_{display_name.lower().replace(" ", "_")}'
-            cached_bars[field] = {'token_pct': percent, 'resets_at': iso_to_unix(resets_at_iso)}
+            cached_bars[field] = {'token_pct': percent, 'resets_at': iso_to_unix(entry.get('resets_at'))}
         cache['_api_error'] = False
     except Exception:
         cache['_api_error'] = True
