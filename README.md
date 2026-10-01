@@ -42,9 +42,9 @@ Every rate limit bar encodes two things at once: how much of the quota has been 
 
 **Dark gray** — no data yet, or the window just opened.
 
-#### Time left
+#### Wait time
 
-An amber bar tells you that you are burning through a quota, but not how long that has to last. Its label therefore carries the time remaining until the window resets: `7d (2d left)`. It is written as a single leading unit — `45m`, `2h`, `3d` — so it fits even a narrow segment.
+An amber bar tells you that the quota is being consumed faster than time is passing, but not by how much. Therefore, its label shows how long you need to refrain from spending quota so that time catches up with consumption and the bar returns to the green zone: `7d (wait 21h)`. Usually this is much sooner than the window reset; at 100% consumption the wait time equals the reset time. The time is written with a single leading unit — `45m`, `2h`, `3d` — so it fits even a narrow segment.
 
 ### Session badges
 

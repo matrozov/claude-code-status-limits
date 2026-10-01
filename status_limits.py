@@ -736,17 +736,17 @@ def format_context_size(size: int) -> str:
 
 def format_remaining(seconds: float) -> str:
     """
-    Компактное представление оставшегося времени единым старшим разрядом:
-    Ns / Nm / Nh / Nd. Цель — однозначно передать порядок («осталось минуты,
+    Компактное представление интервала времени единым старшим разрядом:
+    Ns / Nm / Nh / Nd. Цель — однозначно передать порядок («ждать минуты,
     а не часы») при минимальной ширине, чтобы приписка влезала даже в узкий
-    жёлтый сегмент бара.
+    янтарный сегмент бара.
 
     Округление к ближайшему (round-to-nearest) с порогами «.5 единицы до
     следующего разряда»: 89 sec → '1m', 90 sec → '2m', 23 h 40 min → '1d'.
     Так избегаем артефактов вроде «задал ровно 3 дня, увидел 2d» из-за
-    микросекундной задержки между вычислением resets_at и time.time().
+    микросекундной задержки между вычислением времени и time.time().
 
-    - seconds: оставшееся время в секундах (ожидается > 0)
+    - seconds: интервал в секундах (ожидается > 0)
     """
     seconds = max(0.0, seconds)
     if seconds < 59.5:
@@ -761,30 +761,31 @@ def format_remaining(seconds: float) -> str:
     return f'{round(days)}d'
 
 
-def eta_label(label: str, token_pct: float | None, time_pct: float | None, resets_at: int | None) -> str:
+def eta_label(label: str, token_pct: float | None, time_pct: float | None, period_seconds: int) -> str:
     """
-    Дописывает к подписи бара '(Nx left)' если расход токенов опережает время —
-    т.е. бар окрашен жёлтым. Это сигнал «жжёшь токены быстрее, чем течёт окно»;
-    оставшееся время до сброса даёт пользователю чёткий ориентир «сколько ещё терпеть».
+    Дописывает к подписи бара '(wait Nx)', если расход токенов опережает время —
+    т.е. бар окрашен янтарным. Это сигнал «жжёшь токены быстрее, чем течёт окно»;
+    приписка показывает, сколько нужно не тратить квоту, чтобы время догнало
+    расход и бар вернулся в нормальную (зелёную) зону. Время до сброса окна
+    для этого не годится: догнать расход обычно можно намного раньше.
+
+    Расход выше 100% время догнать не может: ожидание ограничено сбросом окна.
 
     Возвращает исходный label без изменений если:
-      - неизвестен token_pct, time_pct или resets_at,
-      - token_pct <= time_pct (бар не жёлтый — приписка не нужна),
-      - время сброса уже в прошлом (на границе периода до обновления данных).
+      - неизвестен token_pct или time_pct,
+      - token_pct <= time_pct (бар не янтарный — приписка не нужна).
 
-    - label:     базовая подпись бара (например, '7d')
-    - token_pct: процент использованных токенов (0–100 или None)
-    - time_pct:  процент прошедшего времени окна (0–100 или None)
-    - resets_at: unix-время сброса окна (или None)
+    - label:          базовая подпись бара (например, '7d')
+    - token_pct:      процент использованных токенов (0–100 или None)
+    - time_pct:       процент прошедшего времени окна (0–100 или None)
+    - period_seconds: длительность окна в секундах
     """
-    if token_pct is None or time_pct is None or resets_at is None:
+    if token_pct is None or time_pct is None:
         return label
     if token_pct <= time_pct:
         return label
-    remaining = resets_at - time_module.time()
-    if remaining <= 0:
-        return label
-    return f'{label} ({format_remaining(remaining)} left)'
+    wait = (min(token_pct, 100.0) - time_pct) / 100.0 * period_seconds
+    return f'{label} (wait {format_remaining(wait)})'
 
 
 def _token_fingerprint(credentials_path: Path) -> str | None:
@@ -1067,7 +1068,7 @@ def main() -> None:
                 continue
             label, period = parsed
             time_pct = time_pct_from_unix(resets_at, period)
-            bars.append((eta_label(label, token_pct, time_pct, resets_at), token_pct, time_pct))
+            bars.append((eta_label(label, token_pct, time_pct, period), token_pct, time_pct))
 
         # API-бары: все поля кеша кроме stdin-полей. Поля с неизвестным префиксом
         # пропускаются: без известного периода нельзя посчитать time_pct.
@@ -1081,7 +1082,7 @@ def main() -> None:
             token_pct = bar_data.get('token_pct')
             resets_at = bar_data.get('resets_at')
             time_pct = time_pct_from_unix(resets_at, period)
-            bars.append((eta_label(label, token_pct, time_pct, resets_at), token_pct, time_pct))
+            bars.append((eta_label(label, token_pct, time_pct, period), token_pct, time_pct))
 
         if cache_updated:
             write_cache(cache_path, cache)
