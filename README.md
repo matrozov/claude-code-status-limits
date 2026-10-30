@@ -28,7 +28,7 @@ The empty part of the bar is tinted by zone — neutral below 150k, faintly warm
 
 ### Rate limit bars
 
-Each bar represents a usage quota within a fixed time window — either 5 hours or 7 days. The bar label and current percentage are shown as text inside the bar.
+Each bar represents a usage quota within a fixed time window — either 5 hours or 7 days. The quota name is displayed as text directly inside the bar. There is no usage percentage: the window size in tokens is not disclosed and fluctuates, so a percentage doesn't tell whether the quota is enough for a task, and closeness to the cap is visible from the bar fill anyway.
 
 #### Reading the colors
 
@@ -42,9 +42,9 @@ Every rate limit bar encodes two things at once: how much of the quota has been 
 
 **Dark gray** — no data yet, or the window just opened.
 
-#### Wait time
+#### Deviation from schedule
 
-An amber bar tells you that the quota is being consumed faster than time is passing, but not by how much. Therefore, its label shows how long you need to refrain from spending quota so that time catches up with consumption and the bar returns to the green zone: `7d (wait 21h)`. Usually this is much sooner than the window reset; at 100% consumption the wait time equals the reset time. The time is written with a single leading unit — `45m`, `2h`, `3d` — so it fits even a narrow segment.
+The color indicates which is ahead—consumption or time—but not by how much. Therefore, the deviation is shown on the right of the bar as a balance: `-21h` means consumption is ahead, and for that long you need to hold off spending the quota to let time catch up and the bar to return to the green zone (usually well before the window reset; at 100% consumption the wait equals the reset); `+1h` means time is ahead, and you can spend that much beyond the even pace before the bar turns amber. A deviation under one minute — effectively moving exactly on schedule — is shown as `±0m`. Time is written with a single leading unit—`45m`, `1.5h`, `21h`, `2.5d`—to fit even in a narrow segment; hours and days under 10 are shown with one decimal place so that 1 h 29 min and 1 h 31 min don't turn into `1h` and `2h`.
 
 ### Session badges
 
@@ -89,11 +89,16 @@ Add the following to `~/.claude/settings.json`:
 ```json
 "statusLine": {
   "type": "command",
-  "command": "python /path/to/claude-code-status-limits/status_limits.py"
+  "command": "python /path/to/claude-code-status-limits/status_limits.py",
+  "refreshInterval": 60
 }
 ```
 
 Adjust the path to wherever you cloned the repository. Python 3.10+ and `curl` are required.
+
+### Refresh during idle time
+
+Claude Code redraws the status bar on events — a new response, `/compact`, mode change — and while you're silent, the bars freeze, even though time in the windows keeps passing. `refreshInterval` reruns the script every N seconds without calling the model. We recommend `60`: the finest unit in the labels is a minute, and one bar cell corresponds to at least several minutes of the window, so there's no need to refresh more often. Usage API data doesn't depend on the interval — it's cached for 5 minutes.
 
 ### Bar width
 

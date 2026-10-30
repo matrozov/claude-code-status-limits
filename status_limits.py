@@ -40,6 +40,12 @@ FIVE_HOUR_SECONDS = 5 * 3600
 SEVEN_DAY_SECONDS = 7 * 24 * 3600
 API_CACHE_TTL     = 300  # секунд
 
+# Минимальное отклонение от графика, с которого бар показывает '+Nx' / '-Nx';
+# меньшее отклонение выводится как '±0m'.
+# Порог в абсолютном времени, а не в доле окна: окна бывают разной длины,
+# и мелкое отклонение на коротком окне так же значимо, как на длинном.
+PACE_MIN_SECONDS = 60
+
 # TTL после неудачной попытки — короче обычного. Сбои usage API обычно
 # транзиентные (типичный случай — Windows не смог проверить отзыв сертификата
 # и оборвал TLS), и держать бейдж-алерт 'API' с пропавшими API-барами все
@@ -327,18 +333,23 @@ def make_bar(
     time_pct: float | None,
     width: int,
     label: str = '',
+    pace: str = '',
 ) -> str:
     """
     Двойной бар с подписью поверх фона.
 
     Фон кодирует время (тёмно-зелёный = время прошло, тёмный = нет).
     Символ █ кодирует токены (зелёный = в норме, жёлтый = перерасход).
-    Подпись рисуется белым текстом поверх первых символов бара.
+    Подпись рисуется белым текстом поверх первых символов бара, отклонение
+    от графика — поверх последних. Процент расхода не выводится: размер окна
+    в токенах не раскрывается и плавает, так что процент не отвечает на вопрос
+    «успею ли», а близость к потолку и так видна по заполнению бара.
 
     - token_pct: процент токенов (0–100 или None)
     - time_pct:  процент прошедшего времени (0–100 или None)
     - width:     ширина бара в символах
     - label:     подпись, рендерится поверх левого края бара
+    - pace:      отклонение от графика из pace_text ('-21h', '+1h' или '')
     """
     token_filled = round((token_pct or 0) / 100.0 * width)
     time_filled  = round((time_pct  or 0) / 100.0 * width)
@@ -347,10 +358,11 @@ def make_bar(
     label_str = (' ' + label + ' ') if label else ''
     label_len = min(len(label_str), width)
 
-    # Процент — справа, с отступом в один пробел от края
-    pct_str   = f'{round(token_pct or 0)}% '
-    pct_len   = min(len(pct_str), width)
-    pct_start = width - pct_len
+    # Отклонение — справа, с отступом в один пробел от края: подпись слева
+    # остаётся неизменной и по ней бар проще найти взглядом.
+    pace_str   = f'{pace} ' if pace else ''
+    pace_len   = min(len(pace_str), width)
+    pace_start = width - pace_len
 
     cells = []
 
@@ -369,8 +381,8 @@ def make_bar(
 
         if i < label_len:
             cells.append(f'{bg}{FG_LABEL}{label_str[i]}{FG_RESET}')
-        elif i >= pct_start:
-            cells.append(f'{bg}{FG_LABEL}{pct_str[i - pct_start]}{FG_RESET}')
+        elif i >= pace_start:
+            cells.append(f'{bg}{FG_LABEL}{pace_str[i - pace_start]}{FG_RESET}')
         else:
             cells.append(f'{bg} {FG_RESET}')
 
@@ -737,9 +749,15 @@ def format_context_size(size: int) -> str:
 def format_remaining(seconds: float) -> str:
     """
     Компактное представление интервала времени единым старшим разрядом:
-    Ns / Nm / Nh / Nd. Цель — однозначно передать порядок («ждать минуты,
-    а не часы») при минимальной ширине, чтобы приписка влезала даже в узкий
-    янтарный сегмент бара.
+    Ns / Nm / Nh / Nd. Цель — однозначно передать порядок («минуты, а не
+    часы») при минимальной ширине, чтобы приписка влезала даже в узкий
+    сегмент бара.
+
+    Часы и дни меньше 10 выводятся с одним знаком после точки ('1.4h',
+    '2.5d'): иначе 1 ч 29 мин и 1 ч 31 мин показывались бы как '1h' и '2h',
+    с ошибкой до половины значения. Нулевая дробь отбрасывается ('2h', а не
+    '2.0h'); от 10 и для минут/секунд — целое число, там дробь уже не
+    добавляет смысла, а только ширину.
 
     Округление к ближайшему (round-to-nearest) с порогами «.5 единицы до
     следующего разряда»: 89 sec → '1m', 90 sec → '2m', 23 h 40 min → '1d'.
@@ -756,36 +774,55 @@ def format_remaining(seconds: float) -> str:
         return f'{round(minutes)}m'
     hours = minutes / 60
     if hours < 23.5:
-        return f'{round(hours)}h'
-    days = hours / 24
-    return f'{round(days)}d'
+        return f'{format_fraction(hours)}h'
+    return f'{format_fraction(hours / 24)}d'
 
 
-def eta_label(label: str, token_pct: float | None, time_pct: float | None, period_seconds: int) -> str:
+def format_fraction(value: float) -> str:
     """
-    Дописывает к подписи бара '(wait Nx)', если расход токенов опережает время —
-    т.е. бар окрашен янтарным. Это сигнал «жжёшь токены быстрее, чем течёт окно»;
-    приписка показывает, сколько нужно не тратить квоту, чтобы время догнало
-    расход и бар вернулся в нормальную (зелёную) зону. Время до сброса окна
-    для этого не годится: догнать расход обычно можно намного раньше.
+    Число для format_remaining: один знак после точки до 10, целое от 10,
+    без нулевой дроби ('1.4', '2', '21').
 
-    Расход выше 100% время догнать не может: ожидание ограничено сбросом окна.
+    - value: неотрицательное число единиц времени
+    """
+    rounded = round(value, 1)
+    if rounded >= 10:
+        return str(round(value))
+    return f'{rounded:g}'
 
-    Возвращает исходный label без изменений если:
-      - неизвестен token_pct или time_pct,
-      - token_pct <= time_pct (бар не янтарный — приписка не нужна).
 
-    - label:          базовая подпись бара (например, '7d')
+def pace_text(token_pct: float | None, time_pct: float | None, period_seconds: int) -> str:
+    """
+    Отклонение расхода от равномерного темпа во времени для правого края бара:
+    '-Nx' — расход опережает время (бар янтарный), '+Nx' — время опережает
+    расход (запас). Знак работает как баланс относительно графика.
+
+    '-Nx' — сколько нужно не тратить квоту, чтобы время догнало расход и бар
+    вернулся в зелёную зону. Время до сброса окна для этого не годится:
+    догнать расход обычно можно намного раньше. Расход выше 100% время догнать
+    не может, поэтому ожидание ограничено сбросом окна.
+
+    '+Nx' — сколько можно тратить сверх равномерного темпа, прежде чем бар
+    станет янтарным.
+
+    Отклонение меньше PACE_MIN_SECONDS в обе стороны — фактически движение
+    ровно по графику — показывается как '±0m', а не пустотой: пустое место
+    на баре выглядит как поломка.
+
+    Возвращает пустую строку, если неизвестен token_pct или time_pct: бар
+    без данных и так целиком тёмно-серый.
+
     - token_pct:      процент использованных токенов (0–100 или None)
     - time_pct:       процент прошедшего времени окна (0–100 или None)
     - period_seconds: длительность окна в секундах
     """
     if token_pct is None or time_pct is None:
-        return label
-    if token_pct <= time_pct:
-        return label
-    wait = (min(token_pct, 100.0) - time_pct) / 100.0 * period_seconds
-    return f'{label} (wait {format_remaining(wait)})'
+        return ''
+    lead_seconds = (min(token_pct, 100.0) - time_pct) / 100.0 * period_seconds
+    if abs(lead_seconds) < PACE_MIN_SECONDS:
+        return '±0m'
+    sign = '-' if lead_seconds > 0 else '+'
+    return f'{sign}{format_remaining(abs(lead_seconds))}'
 
 
 def _token_fingerprint(credentials_path: Path) -> str | None:
@@ -1055,8 +1092,8 @@ def main() -> None:
                 cached_bars[field] = {'token_pct': token_pct, 'resets_at': resets_at}
                 cache_updated = True
 
-        # Rate-limit бары: (label, token_pct, time_pct)
-        bars: list[tuple[str, float | None, float | None]] = []
+        # Rate-limit бары: (label, pace, token_pct, time_pct)
+        bars: list[tuple[str, str, float | None, float | None]] = []
 
         for field in STDIN_BAR_FIELDS:
             cached = cached_bars.get(field) or {}
@@ -1068,7 +1105,7 @@ def main() -> None:
                 continue
             label, period = parsed
             time_pct = time_pct_from_unix(resets_at, period)
-            bars.append((eta_label(label, token_pct, time_pct, period), token_pct, time_pct))
+            bars.append((label, pace_text(token_pct, time_pct, period), token_pct, time_pct))
 
         # API-бары: все поля кеша кроме stdin-полей. Поля с неизвестным префиксом
         # пропускаются: без известного периода нельзя посчитать time_pct.
@@ -1082,7 +1119,7 @@ def main() -> None:
             token_pct = bar_data.get('token_pct')
             resets_at = bar_data.get('resets_at')
             time_pct = time_pct_from_unix(resets_at, period)
-            bars.append((eta_label(label, token_pct, time_pct, period), token_pct, time_pct))
+            bars.append((label, pace_text(token_pct, time_pct, period), token_pct, time_pct))
 
         if cache_updated:
             write_cache(cache_path, cache)
@@ -1252,9 +1289,9 @@ def main() -> None:
         make_ctx_bar(ctx_display_pct, ctx_bar_width, level=ctx_level,
                      amber_at=amber_at, danger_at=danger_at)
     ]
-    for idx, (label, token_pct, time_pct) in enumerate(bars):
+    for idx, (label, pace, token_pct, time_pct) in enumerate(bars):
         width = bar_width + (last_bar_extra if idx == len(bars) - 1 else 0)
-        parts.append(make_bar(token_pct, time_pct, width, label))
+        parts.append(make_bar(token_pct, time_pct, width, label, pace))
 
     if model_info_text:
         parts.append(model_info_text)
