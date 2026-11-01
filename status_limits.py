@@ -1081,22 +1081,31 @@ def main() -> None:
             level_raw = cache.get('claude_effort') or ''
         effort_label = EFFORT_LABELS.get(level_raw)
 
-        # five_hour и seven_day: stdin обновляет кеш и перекрывает данные из API
-        rate_limits = stdin_data.get('rate_limits') or {}
-        for field in STDIN_BAR_FIELDS:
-            window = rate_limits.get(field) or {}
-            token_pct = window.get('used_percentage')
-            resets_at = window.get('resets_at')
+        # five_hour и seven_day: stdin обновляет кеш и перекрывает данные из API.
+        # Когда rate_limits в stdin есть, он — источник истины по набору окон:
+        # окно, которого в нём нет, отменено на тарифе (так пропал 5h), и его
+        # бар убирается из кеша, иначе висело бы последнее значение навсегда.
+        # Без rate_limits (до первого ответа модели) кеш не трогается.
+        rate_limits = stdin_data.get('rate_limits')
+        if isinstance(rate_limits, dict):
+            for field in STDIN_BAR_FIELDS:
+                window = rate_limits.get(field) or {}
+                token_pct = window.get('used_percentage')
+                resets_at = window.get('resets_at')
 
-            if token_pct is not None or resets_at is not None:
-                cached_bars[field] = {'token_pct': token_pct, 'resets_at': resets_at}
-                cache_updated = True
+                if token_pct is not None or resets_at is not None:
+                    cached_bars[field] = {'token_pct': token_pct, 'resets_at': resets_at}
+                    cache_updated = True
+                elif cached_bars.pop(field, None) is not None:
+                    cache_updated = True
 
         # Rate-limit бары: (label, pace, token_pct, time_pct)
         bars: list[tuple[str, str, float | None, float | None]] = []
 
         for field in STDIN_BAR_FIELDS:
-            cached = cached_bars.get(field) or {}
+            cached = cached_bars.get(field)
+            if cached is None:
+                continue
             token_pct = cached.get('token_pct')
             resets_at = cached.get('resets_at')
 

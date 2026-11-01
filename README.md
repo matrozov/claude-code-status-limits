@@ -72,7 +72,7 @@ The project directory name is appended at the very end, so several open windows 
 
 The script receives data from two independent sources.
 
-**Claude Code itself** passes context window fill and the 5h/7d rate limit state after each turn. These values are only available once the conversation has started, so the very first render of a new chat relies on cached data from the previous session.
+**Claude Code itself** passes context window fill and the 5h/7d rate limit state after each turn. These values are only available once the conversation has started, so the very first render of a new chat relies on cached data from the previous session. If any window is missing from the provided data (for example, if the 5-hour limit is removed from the plan), its bar is hidden.
 
 **The Claude.ai usage API** provides per-model quotas such as Sonnet 7d and Opus 7d, including limits scoped to a single model — the weekly Fable one, for example. It is queried using the OAuth token that Claude Code itself uses to authenticate, so no separate credentials are needed. The API is refreshed at most once every 5 minutes, or once a minute after a failed attempt, since those failures are usually transient.
 
